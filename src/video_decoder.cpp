@@ -54,14 +54,17 @@ bool VideoDecoder::init(VideoCodecType type) {
         cleanup();
     }
 
+    // Suppress verbose FFmpeg warnings (optional - removes the mmco spam from logs)
+    av_log_set_level(AV_LOG_FATAL);
+
     codec_type_ = type;
 
     // Find decoder
     AVCodecID codec_id = (type == VideoCodecType::H264) ? AV_CODEC_ID_H264 : AV_CODEC_ID_HEVC;
     codec_ = avcodec_find_decoder(codec_id);
     if (!codec_) {
-        std::cerr << "[VideoDecoder] Could not find " 
-                  << (type == VideoCodecType::H264 ? "H.264" : "H.265") 
+        std::cerr << "[VideoDecoder] Could not find "
+                  << (type == VideoCodecType::H264 ? "H.264" : "H.265")
                   << " decoder" << std::endl;
         return false;
     }
@@ -73,9 +76,11 @@ bool VideoDecoder::init(VideoCodecType type) {
         return false;
     }
 
-    // Set some options for low-latency decoding
+    // Configure decoder BEFORE opening
     codec_ctx_->flags |= AV_CODEC_FLAG_LOW_DELAY;
     codec_ctx_->flags2 |= AV_CODEC_FLAG2_FAST;
+    codec_ctx_->refs = 16;  // Allow up to 16 reference frames
+    codec_ctx_->err_recognition = 0;  // Be tolerant of errors
 
     // Open codec
     if (avcodec_open2(codec_ctx_, codec_, nullptr) < 0) {
@@ -133,6 +138,12 @@ bool VideoDecoder::initSwsContext(int width, int height) {
         width, height, AV_PIX_FMT_BGR24,
         SWS_BILINEAR, nullptr, nullptr, nullptr
     );
+
+    // Set color range to suppress deprecated format warning
+    if (sws_ctx_) {
+        av_opt_set_int(sws_ctx_, "src_range", 1, 0);  // Full range
+        av_opt_set_int(sws_ctx_, "dst_range", 1, 0);  // Full range
+    }
 
     if (!sws_ctx_) {
         std::cerr << "[VideoDecoder] Could not create SwsContext" << std::endl;
