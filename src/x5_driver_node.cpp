@@ -60,6 +60,7 @@ public:
         // Create publishers
         pub_lens0_ = it_.advertise("x5/lens0", 1);
         pub_lens1_ = it_.advertise("x5/lens1", 1);
+        pub_combined_ = it_.advertise("x5/combined", 1);
         pub_imu_ = nh_.advertise<sensor_msgs::Imu>("x5/imu", 100);
         pub_exposure_ = nh_.advertise<sensor_msgs::TimeReference>("x5/exposure", 10);
         pub_recording_info_ = nh_.advertise<std_msgs::String>("x5/recording_info", 1, true);  // Latched
@@ -221,6 +222,8 @@ private:
         pnh_.param<std::string>("lens0_frame_id", lens0_frame_id_, "x5_lens0");
         pnh_.param<std::string>("lens1_frame_id", lens1_frame_id_, "x5_lens1");
         pnh_.param<std::string>("imu_frame_id", imu_frame_id_, "x5_imu");
+        pnh_.param<bool>("publish_combined", publish_combined_, true);
+        pnh_.param<std::string>("combined_format", combined_format_, "sidebyside");
 
         ROS_INFO("Parameters:");
         ROS_INFO("  preview_resolution: %s", preview_resolution_.c_str());
@@ -273,22 +276,80 @@ private:
         cv_bridge::CvImage cv_img(header, "bgr8", frame.image);
         sensor_msgs::ImagePtr img_msg = cv_img.toImageMsg();
 
-        // Publish to appropriate topic
+        // Publish to appropriate topic and store for combined
         if (frame.stream_index == 0) {
             pub_lens0_.publish(img_msg);
             lens0_count_++;
+
+            if (publish_combined_) {
+                std::lock_guard<std::mutex> lock(frame_sync_mutex_);
+                last_lens0_frame_ = frame.image.clone();
+                last_lens0_timestamp_ = frame.timestamp_ms;
+            }
         } else {
             pub_lens1_.publish(img_msg);
             lens1_count_++;
+
+            if (publish_combined_) {
+                std::lock_guard<std::mutex> lock(frame_sync_mutex_);
+                last_lens1_frame_ = frame.image.clone();
+                last_lens1_timestamp_ = frame.timestamp_ms;
+            }
+        }
+
+        // Try to publish combined image
+        if (publish_combined_) {
+            tryPublishCombined();
         }
 
         // Periodic logging
         static int log_counter = 0;
-        if (++log_counter >= 300) {  // Every ~10 seconds at 30fps
+        if (++log_counter >= 300) {
             log_counter = 0;
             ROS_INFO("Published - lens0: %lu, lens1: %lu, imu: %lu", 
                      lens0_count_, lens1_count_, imu_count_);
         }
+    }
+
+    void tryPublishCombined() {
+        std::lock_guard<std::mutex> lock(frame_sync_mutex_);
+
+        // Need both frames
+        if (last_lens0_frame_.empty() || last_lens1_frame_.empty()) {
+            return;
+        }
+
+        // Check timestamps match (within 1ms - should be same frame)
+        if (std::abs(last_lens0_timestamp_ - last_lens1_timestamp_) > 1.0) {
+            return;
+        }
+
+        // Validate dimensions match
+        if (last_lens0_frame_.size() != last_lens1_frame_.size()) {
+            ROS_WARN_THROTTLE(5, "Lens frames have different sizes");
+            return;
+        }
+
+        // Combine frames
+        cv::Mat combined;
+        if (combined_format_ == "topbottom") {
+            cv::vconcat(last_lens0_frame_, last_lens1_frame_, combined);
+        } else {
+            // Default: sidebyside
+            cv::hconcat(last_lens0_frame_, last_lens1_frame_, combined);
+        }
+
+        // Publish
+        std_msgs::Header header;
+        header.stamp = ros::Time(last_lens0_timestamp_ / 1000.0);
+        header.frame_id = "x5_combined";
+
+        cv_bridge::CvImage cv_img(header, "bgr8", combined);
+        pub_combined_.publish(cv_img.toImageMsg());
+
+        // Clear frames
+        last_lens0_frame_.release();
+        last_lens1_frame_.release();
     }
 
     void publishExposure(const ExposureInfo& exp) {
@@ -394,6 +455,7 @@ private:
     // Publishers
     image_transport::Publisher pub_lens0_;
     image_transport::Publisher pub_lens1_;
+    image_transport::Publisher pub_combined_;
     ros::Publisher pub_imu_;
     ros::Publisher pub_exposure_;
     ros::Publisher pub_recording_info_;
@@ -417,6 +479,8 @@ private:
     std::string lens0_frame_id_;
     std::string lens1_frame_id_;
     std::string imu_frame_id_;
+    bool publish_combined_;
+    std::string combined_format_;
 
     // State
     std::atomic<bool> running_{false};
@@ -426,6 +490,13 @@ private:
     uint64_t imu_count_ = 0;
     uint64_t lens0_count_ = 0;
     uint64_t lens1_count_ = 0;
+
+    // Frame synchronization for combined image
+    cv::Mat last_lens0_frame_;
+    cv::Mat last_lens1_frame_;
+    double last_lens0_timestamp_ = 0;
+    double last_lens1_timestamp_ = 0;
+    std::mutex frame_sync_mutex_;
 };
 
 // ============================================================================

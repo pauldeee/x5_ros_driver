@@ -6,6 +6,8 @@
     <arg name="auto_start_recording" default="true" doc="Start SD recording on launch"/>
     <arg name="battery_poll_interval_sec" default="30" doc="Battery check interval in seconds"/>
     <arg name="low_battery_threshold_percent" default="15" doc="Auto-save when battery below this %"/>
+    <arg name="publish_combined" default="true" doc="Publish combined dual-fisheye image"/>
+    <arg name="combined_format" default="sidebyside" doc="Combined image format: sidebyside or topbottom"/>
 
     <!-- X5 Driver Node -->
     <node name="x5_driver" pkg="x5_ros_driver" type="x5_driver_node" output="screen" required="true">
@@ -18,5 +20,7 @@
         <param name="auto_start_recording" value="$(arg auto_start_recording)"/>
         <param name="battery_poll_interval_sec" value="$(arg battery_poll_interval_sec)"/>
         <param name="low_battery_threshold_percent" value="$(arg low_battery_threshold_percent)"/>
+        <param name="publish_combined" value="$(arg publish_combined)"/>
+        <param name="combined_format" value="$(arg combined_format)"/>
     </node>
 </launch>

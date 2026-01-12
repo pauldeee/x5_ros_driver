@@ -17,6 +17,10 @@ auto_start_recording: true
 battery_poll_interval_sec: 30    # How often to check/publish battery level
 low_battery_threshold_percent: 15  # Auto-save and shutdown below this level
 
+# Combined image output (both lenses in one image)
+publish_combined: true
+combined_format: "sidebyside"  # "sidebyside" (2160x1080) or "topbottom" (1080x2160)
+
 # Frame IDs for TF
 lens0_frame_id: "x5_lens0"
 lens1_frame_id: "x5_lens1"
