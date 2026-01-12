@@ -1,0 +1,23 @@
+# X5 ROS Driver Parameters
+
+# Preview stream resolution for live topics
+# Options: "4k", "2k", "1080", "960"
+# Lower resolution = less CPU usage
+preview_resolution: "1080"
+
+# SD card recording resolution  
+# Options: "8k", "5.7k"
+# Always use 8k for best quality
+recording_resolution: "8k"
+
+# Automatically start SD recording when node launches
+auto_start_recording: true
+
+# Battery monitoring
+battery_poll_interval_sec: 30    # How often to check/publish battery level
+low_battery_threshold_percent: 15  # Auto-save and shutdown below this level
+
+# Frame IDs for TF
+lens0_frame_id: "x5_lens0"
+lens1_frame_id: "x5_lens1"
+imu_frame_id: "x5_imu"

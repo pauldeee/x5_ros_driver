@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- Arguments -->
+    <arg name="preview_resolution" default="1080" doc="Preview resolution: 4k, 2k, 1080, 960"/>
+    <arg name="recording_resolution" default="8k" doc="SD recording resolution: 8k, 5.7k"/>
+    <arg name="auto_start_recording" default="true" doc="Start SD recording on launch"/>
+    <arg name="battery_poll_interval_sec" default="30" doc="Battery check interval in seconds"/>
+    <arg name="low_battery_threshold_percent" default="15" doc="Auto-save when battery below this %"/>
+
+    <!-- X5 Driver Node -->
+    <node name="x5_driver" pkg="x5_ros_driver" type="x5_driver_node" output="screen" required="true">
+        <!-- Load default params -->
+        <rosparam file="$(find x5_ros_driver)/config/x5_params.yaml"/>
+        
+        <!-- Override with launch args -->
+        <param name="preview_resolution" value="$(arg preview_resolution)"/>
+        <param name="recording_resolution" value="$(arg recording_resolution)"/>
+        <param name="auto_start_recording" value="$(arg auto_start_recording)"/>
+        <param name="battery_poll_interval_sec" value="$(arg battery_poll_interval_sec)"/>
+        <param name="low_battery_threshold_percent" value="$(arg low_battery_threshold_percent)"/>
+    </node>
+</launch>

@@ -1,0 +1,33 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>x5_ros_driver</name>
+  <version>0.1.0</version>
+  <description>ROS driver for Insta360 X5 camera with IMU streaming and SD recording</description>
+
+  <maintainer email="user@example.com">Paul</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <!-- ROS dependencies -->
+  <depend>roscpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>cv_bridge</depend>
+  <depend>image_transport</depend>
+
+  <!-- System dependencies -->
+  <build_depend>libavcodec-dev</build_depend>
+  <build_depend>libavformat-dev</build_depend>
+  <build_depend>libswscale-dev</build_depend>
+  <build_depend>libavutil-dev</build_depend>
+  
+  <exec_depend>libavcodec58</exec_depend>
+  <exec_depend>libavformat58</exec_depend>
+  <exec_depend>libswscale5</exec_depend>
+  <exec_depend>libavutil56</exec_depend>
+
+  <export>
+  </export>
+</package>

@@ -1,0 +1,12 @@
+# Insta360 Camera USB permissions
+# Copy this file to /etc/udev/rules.d/
+# Then run:
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+# And reconnect the camera
+
+# Insta360 cameras (vendor ID 0x2e1a)
+SUBSYSTEM=="usb", ATTR{idVendor}=="2e1a", MODE="0666", GROUP="plugdev"
+
+# Alternative rule using ATTRS for more specific matching
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="2e1a", MODE="0666", GROUP="plugdev"
