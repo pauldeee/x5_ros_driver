@@ -8,6 +8,8 @@
     <arg name="low_battery_threshold_percent" default="15" doc="Auto-save when battery below this %"/>
     <arg name="publish_combined" default="true" doc="Publish combined dual-fisheye image"/>
     <arg name="combined_format" default="sidebyside" doc="Combined image format: sidebyside or topbottom"/>
+    <arg name="use_gps_time" default="true" doc="Use GPS time from external topic"/>
+    <arg name="gps_time_topic" default="/ext/time" doc="Topic providing GPS time reference"/>
 
     <!-- X5 Driver Node -->
     <node name="x5_driver" pkg="x5_ros_driver" type="x5_driver_node" output="screen" required="true">
@@ -22,5 +24,7 @@
         <param name="low_battery_threshold_percent" value="$(arg low_battery_threshold_percent)"/>
         <param name="publish_combined" value="$(arg publish_combined)"/>
         <param name="combined_format" value="$(arg combined_format)"/>
+        <param name="use_gps_time" value="$(arg use_gps_time)"/>
+        <param name="gps_time_topic" value="$(arg gps_time_topic)"/>
     </node>
 </launch>

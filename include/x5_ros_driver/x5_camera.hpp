@@ -175,10 +175,63 @@ public:
      */
     bool shutdownCamera();
 
+    /**
+     * @brief Sync camera clock to system time and compute offset
+     * @param max_offset_ms Maximum acceptable offset (not used for validation anymore)
+     * @return true if offset computed successfully
+     */
+    bool syncTimeToSystem(int64_t max_offset_ms = 100);
+
+    /**
+     * @brief Get current camera media time
+     * @return Camera time in milliseconds, or -1 on error
+     */
+    int64_t getCameraTime();
+
+    /**
+     * @brief Get time offset (system_time_ms = camera_time_ms + offset)
+     */
+    int64_t getTimeOffset() const { return time_offset_ms_; }
+
+    /**
+     * @brief Check if camera time offset has been computed
+     */
+    bool isTimeOffsetValid() const { return time_offset_valid_; }
+
+    /**
+     * @brief Set GPS time offset (call when /ext/time received)
+     * @param system_time_ms System/PC time in milliseconds
+     * @param gps_time_ms GPS time in milliseconds
+     */
+    void setGpsTimeOffset(int64_t system_time_ms, int64_t gps_time_ms);
+
+    /**
+     * @brief Check if GPS time offset is valid
+     */
+    bool isGpsTimeOffsetValid() const { return gps_time_offset_valid_; }
+
+    /**
+     * @brief Convert camera timestamp to GPS time
+     * @param camera_time_ms Camera media time in milliseconds
+     * @return GPS time in milliseconds (or system time if GPS not available)
+     */
+    int64_t cameraTimeToGpsTime(int64_t camera_time_ms);
+
 private:
     // SDK Stream delegate (inner class)
     class StreamDelegateImpl;
     friend class StreamDelegateImpl;
+
+    // Time synchronization (camera to system)
+    int64_t time_offset_ms_ = 0;          // system_time_ms = camera_time_ms + offset
+    bool time_offset_valid_ = false;
+
+    // GPS time synchronization (system to GPS)
+    int64_t gps_time_offset_ms_ = 0;      // gps_time_ms = system_time_ms + offset
+    bool gps_time_offset_valid_ = false;
+    double gps_offset_filtered_ = 0.0;
+    bool gps_offset_initialized_ = false;
+    std::mutex gps_time_mutex_;
 
     // Camera instance
     std::shared_ptr<ins_camera::Camera> camera_;

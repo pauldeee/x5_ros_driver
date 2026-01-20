@@ -25,3 +25,9 @@ combined_format: "sidebyside"  # "sidebyside" (2160x1080) or "topbottom" (1080x2
 lens0_frame_id: "x5_lens0"
 lens1_frame_id: "x5_lens1"
 imu_frame_id: "x5_imu"
+
+
+# Time synchronization
+sync_time_on_connect: true    # Compute camera→system offset at startup
+use_gps_time: true            # Convert timestamps to GPS time domain
+gps_time_topic: "/ext/time"   # Topic providing GPS time reference

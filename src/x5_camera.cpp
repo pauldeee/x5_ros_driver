@@ -2,6 +2,8 @@
 #include <iostream>
 #include <chrono>
 #include <thread>
+#include <ctime>
+
 
 namespace x5_ros_driver {
 
@@ -538,6 +540,107 @@ bool X5Camera::shutdownCamera() {
     }
     
     return result;
+}
+
+int64_t X5Camera::getCameraTime() {
+    if (!connected_ || !camera_) {
+        return -1;
+    }
+    return camera_->GetCameraMediaTime();
+}
+
+bool X5Camera::syncTimeToSystem(int64_t max_offset_ms) {
+    if (!connected_ || !camera_) {
+        std::cerr << "[X5Camera] Cannot sync time - not connected" << std::endl;
+        return false;
+    }
+
+    // =========================================
+    // Step 1: Sync camera wall clock (for file naming, etc.)
+    // This doesn't affect GetCameraMediaTime()
+    // =========================================
+    time_t now = time(nullptr);
+    std::tm tm{};
+    localtime_r(&now, &tm);
+    time_t time_seconds = timegm(&tm);
+
+    std::cout << "[X5Camera] Syncing camera wall clock..." << std::endl;
+    std::cout << "  Local time: " << now << std::endl;
+    std::cout << "  GMT time: " << time_seconds << std::endl;
+    std::cout << "  TZ offset: " << (time_seconds - now) << " sec" << std::endl;
+
+    if (!camera_->SyncLocalTimeToCamera(now, time_seconds - now)) {
+        std::cerr << "[X5Camera] SyncLocalTimeToCamera() failed (non-critical)" << std::endl;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // =========================================
+    // Step 2: Compute offset between system time and camera media time
+    // GetCameraMediaTime() returns time since boot, not wall clock
+    // =========================================
+    const int num_samples = 5;
+    int64_t offset_sum = 0;
+
+    std::cout << "[X5Camera] Computing camera→system time offset..." << std::endl;
+
+    for (int i = 0; i < num_samples; i++) {
+        auto t1 = std::chrono::system_clock::now();
+        int64_t camera_time = camera_->GetCameraMediaTime();
+        auto t2 = std::chrono::system_clock::now();
+
+        // Use midpoint for best estimate
+        auto t_mid = t1 + (t2 - t1) / 2;
+        int64_t system_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            t_mid.time_since_epoch()).count();
+
+        int64_t offset = system_time_ms - camera_time;
+        offset_sum += offset;
+
+        std::cout << "  Sample " << (i + 1) << ": system=" << system_time_ms
+                  << " camera=" << camera_time << " offset=" << offset << " ms" << std::endl;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    time_offset_ms_ = offset_sum / num_samples;
+    time_offset_valid_ = true;
+
+    std::cout << "[X5Camera] Camera→System offset: " << time_offset_ms_ << " ms" << std::endl;
+
+    return true;
+}
+
+void X5Camera::setGpsTimeOffset(int64_t system_time_ms, int64_t gps_time_ms) {
+    std::lock_guard<std::mutex> lock(gps_time_mutex_);
+
+    int64_t new_offset = gps_time_ms - system_time_ms;
+
+    if (!gps_offset_initialized_) {
+        // First sample - initialize directly
+        gps_offset_filtered_ = static_cast<double>(new_offset);
+        gps_offset_initialized_ = true;
+        std::cout << "[X5Camera] GPS time offset initialized: " << new_offset << " ms" << std::endl;
+    } else {
+        // Low-pass filter: alpha = 0.1 gives ~10 sample smoothing
+        const double alpha = 0.1;
+        gps_offset_filtered_ = alpha * new_offset + (1.0 - alpha) * gps_offset_filtered_;
+    }
+
+    gps_time_offset_ms_ = static_cast<int64_t>(gps_offset_filtered_);
+    gps_time_offset_valid_ = true;
+}
+
+int64_t X5Camera::cameraTimeToGpsTime(int64_t camera_time_ms) {
+    // Step 1: camera → system
+    int64_t system_time_ms = camera_time_ms + time_offset_ms_;
+
+    // Step 2: system → GPS (if available)
+    std::lock_guard<std::mutex> lock(gps_time_mutex_);
+    if (gps_time_offset_valid_) {
+        return system_time_ms + gps_time_offset_ms_;
+    }
+    return system_time_ms;  // Fallback to system time
 }
 
 } // namespace x5_ros_driver

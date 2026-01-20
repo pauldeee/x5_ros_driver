@@ -90,6 +90,15 @@ public:
             return false;
         }
 
+        // Sync camera time to system time
+        if (sync_time_on_connect_) {
+            if (g_camera->syncTimeToSystem(100)) {  // 100ms tolerance
+                ROS_INFO("Camera time synchronized to system time");
+            } else {
+                ROS_WARN("Camera time sync failed or offset too large - timestamps may be inaccurate");
+            }
+        }
+
         // Set callbacks
         g_camera->setImuCallback([this](const ImuSample& imu) {
             publishImu(imu);
@@ -110,6 +119,13 @@ public:
             if (free_mb < 1024) {
                 ROS_WARN("Low storage! Only %lu MB free on SD card", free_mb);
             }
+        }
+
+        // Subscribe to GPS time if enabled
+        if (use_gps_time_) {
+            sub_gps_time_ = nh_.subscribe(gps_time_topic_, 10, &X5DriverNode::gpsTimeCallback, this);
+            ROS_INFO("Subscribing to GPS time: %s", gps_time_topic_.c_str());
+            ROS_INFO("Waiting for first GPS time message...");
         }
 
         // Get battery
@@ -224,6 +240,9 @@ private:
         pnh_.param<std::string>("imu_frame_id", imu_frame_id_, "x5_imu");
         pnh_.param<bool>("publish_combined", publish_combined_, true);
         pnh_.param<std::string>("combined_format", combined_format_, "sidebyside");
+        pnh_.param<bool>("sync_time_on_connect", sync_time_on_connect_, true);
+        pnh_.param<bool>("use_gps_time", use_gps_time_, false);
+        pnh_.param<std::string>("gps_time_topic", gps_time_topic_, "/ext/time");
 
         ROS_INFO("Parameters:");
         ROS_INFO("  preview_resolution: %s", preview_resolution_.c_str());
@@ -231,14 +250,20 @@ private:
         ROS_INFO("  auto_start_recording: %s", auto_start_recording_ ? "true" : "false");
         ROS_INFO("  battery_poll_interval_sec: %d", battery_poll_interval_sec_);
         ROS_INFO("  low_battery_threshold_percent: %d%%", low_battery_threshold_percent_);
+        ROS_INFO("  sync_time_on_connect: %s", sync_time_on_connect_ ? "true" : "false");
+        ROS_INFO("  use_gps_time: %s", use_gps_time_ ? "true" : "false");
+        if (use_gps_time_) {
+            ROS_INFO("  gps_time_topic: %s", gps_time_topic_.c_str());
+        }
     }
 
     void publishImu(const ImuSample& imu) {
         sensor_msgs::Imu msg;
         
-        // Convert X5 timestamp (ms) to ROS time
-        // For now, use X5 native time. Offline processing will handle sync.
-        msg.header.stamp = ros::Time(imu.timestamp_ms / 1000.0);
+        // Convert camera time to GPS time (or system time if GPS not available)
+        int64_t output_time_ms = g_camera->cameraTimeToGpsTime(static_cast<int64_t>(imu.timestamp_ms));
+        msg.header.stamp.sec = output_time_ms / 1000;
+        msg.header.stamp.nsec = (output_time_ms % 1000) * 1000000;
         msg.header.frame_id = imu_frame_id_;
 
         // Angular velocity (rad/s)
@@ -265,8 +290,11 @@ private:
             return;
         }
 
-        // Convert X5 timestamp (ms) to ROS time
-        ros::Time stamp(frame.timestamp_ms / 1000.0);
+        // Convert camera time to GPS time (or system time if GPS not available)
+        int64_t output_time_ms = g_camera->cameraTimeToGpsTime(static_cast<int64_t>(frame.timestamp_ms));
+        ros::Time stamp;
+        stamp.sec = output_time_ms / 1000;
+        stamp.nsec = (output_time_ms % 1000) * 1000000;
 
         // Create image message
         std_msgs::Header header;
@@ -341,7 +369,9 @@ private:
 
         // Publish
         std_msgs::Header header;
-        header.stamp = ros::Time(last_lens0_timestamp_ / 1000.0);
+        int64_t output_time_ms = g_camera->cameraTimeToGpsTime(static_cast<int64_t>(last_lens0_timestamp_));
+        header.stamp.sec = output_time_ms / 1000;
+        header.stamp.nsec = (output_time_ms % 1000) * 1000000;
         header.frame_id = "x5_combined";
 
         cv_bridge::CvImage cv_img(header, "bgr8", combined);
@@ -354,16 +384,16 @@ private:
 
     void publishExposure(const ExposureInfo& exp) {
         sensor_msgs::TimeReference msg;
-        
-        // header.stamp = ROS time when we received this
-        // time_ref = X5 timestamp
+
         msg.header.stamp = ros::Time::now();
-        msg.header.frame_id = lens0_frame_id_;  // Associated with frames
-        
-        // Store X5 timestamp in time_ref
-        msg.time_ref = ros::Time(exp.timestamp_ms / 1000.0);
-        
-        // Store exposure time in source field as string (hacky but simple)
+        msg.header.frame_id = lens0_frame_id_;
+
+        // Store converted X5 timestamp in time_ref
+        int64_t output_time_ms = g_camera->cameraTimeToGpsTime(static_cast<int64_t>(exp.timestamp_ms));
+        msg.time_ref.sec = output_time_ms / 1000;
+        msg.time_ref.nsec = (output_time_ms % 1000) * 1000000;
+
+        // Store exposure time in source field
         msg.source = std::to_string(exp.exposure_time_sec);
 
         pub_exposure_.publish(msg);
@@ -447,6 +477,17 @@ private:
         return true;
     }
 
+    void gpsTimeCallback(const sensor_msgs::TimeReference::ConstPtr& msg) {
+        if (!g_camera) return;
+
+        int64_t system_time_ms = static_cast<int64_t>(msg->header.stamp.sec) * 1000
+                               + msg->header.stamp.nsec / 1000000;
+        int64_t gps_time_ms = static_cast<int64_t>(msg->time_ref.sec) * 1000
+                            + msg->time_ref.nsec / 1000000;
+
+        g_camera->setGpsTimeOffset(system_time_ms, gps_time_ms);
+    }
+
     // ROS
     ros::NodeHandle nh_;
     ros::NodeHandle pnh_;
@@ -481,6 +522,12 @@ private:
     std::string imu_frame_id_;
     bool publish_combined_;
     std::string combined_format_;
+    bool sync_time_on_connect_;
+
+    // GPS time sync
+    bool use_gps_time_;
+    std::string gps_time_topic_;
+    ros::Subscriber sub_gps_time_;
 
     // State
     std::atomic<bool> running_{false};
