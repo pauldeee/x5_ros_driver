@@ -11,11 +11,11 @@ preview_resolution: "1080"
 recording_resolution: "8k"
 
 # Automatically start SD recording when node launches
-auto_start_recording: true
+auto_start_recording: false
 
 # Battery monitoring
 battery_poll_interval_sec: 30    # How often to check/publish battery level
-low_battery_threshold_percent: 15  # Auto-save and shutdown below this level
+low_battery_threshold_percent: 3  # Auto-save and shutdown below this level
 
 # Combined image output (both lenses in one image)
 publish_combined: true
@@ -31,3 +31,10 @@ imu_frame_id: "x5_imu"
 sync_time_on_connect: true    # Compute camera→system offset at startup
 use_gps_time: true            # Convert timestamps to GPS time domain
 gps_time_topic: "/ext/time"   # Topic providing GPS time reference
+
+# Trigger synchronization
+# When enabled, only publish images synchronized with external trigger
+# Images are stamped with trigger's GPS time for lidar correlation
+use_trigger_sync: true
+camera_trigger_topic: "/camera_trigger_time"
+trigger_max_age_sec: 0.15     # Discard triggers older than this (seconds)
