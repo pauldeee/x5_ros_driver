@@ -394,14 +394,20 @@ private:
         cv_bridge::CvImage cv_img(header, "bgr8", frame.image);
         sensor_msgs::ImagePtr img_msg = cv_img.toImageMsg();
 
-        // Publish to appropriate topic and store for combined
+        // Publish to appropriate topic and copy directly into pre-allocated combined buffer
         if (frame.stream_index == 0) {
             pub_lens0_.publish(img_msg);
             lens0_count_++;
 
             if (publish_combined_) {
-                std::lock_guard <std::mutex> lock(frame_sync_mutex_);
-                last_lens0_frame_ = frame.image.clone();
+                std::lock_guard<std::mutex> lock(frame_sync_mutex_);
+                ensureCombinedBufferInitialized(frame.image.size());
+                // Copy directly into left/top region of combined buffer (avoids intermediate clone)
+                if (combined_format_ == "topbottom") {
+                    frame.image.copyTo(combined_buffer_(cv::Rect(0, 0, frame.image.cols, frame.image.rows)));
+                } else {
+                    frame.image.copyTo(combined_buffer_(cv::Rect(0, 0, frame.image.cols, frame.image.rows)));
+                }
                 last_lens0_timestamp_ = frame.timestamp_ms;
                 last_lens0_stamp_ = stamp;
             }
@@ -410,8 +416,14 @@ private:
             lens1_count_++;
 
             if (publish_combined_) {
-                std::lock_guard <std::mutex> lock(frame_sync_mutex_);
-                last_lens1_frame_ = frame.image.clone();
+                std::lock_guard<std::mutex> lock(frame_sync_mutex_);
+                ensureCombinedBufferInitialized(frame.image.size());
+                // Copy directly into right/bottom region of combined buffer (avoids intermediate clone)
+                if (combined_format_ == "topbottom") {
+                    frame.image.copyTo(combined_buffer_(cv::Rect(0, frame.image.rows, frame.image.cols, frame.image.rows)));
+                } else {
+                    frame.image.copyTo(combined_buffer_(cv::Rect(frame.image.cols, 0, frame.image.cols, frame.image.rows)));
+                }
                 last_lens1_timestamp_ = frame.timestamp_ms;
                 last_lens1_stamp_ = stamp;
             }
@@ -438,10 +450,10 @@ private:
     }
 
     void tryPublishCombined() {
-        std::lock_guard <std::mutex> lock(frame_sync_mutex_);
+        std::lock_guard<std::mutex> lock(frame_sync_mutex_);
 
-        // Need both frames
-        if (last_lens0_frame_.empty() || last_lens1_frame_.empty()) {
+        // Need both frames (timestamp < 0 means not yet received this cycle)
+        if (last_lens0_timestamp_ < 0 || last_lens1_timestamp_ < 0) {
             return;
         }
 
@@ -450,32 +462,17 @@ private:
             return;
         }
 
-        // Validate dimensions match
-        if (last_lens0_frame_.size() != last_lens1_frame_.size()) {
-            ROS_WARN_THROTTLE(5, "Lens frames have different sizes");
-            return;
-        }
-
-        // Combine frames
-        cv::Mat combined;
-        if (combined_format_ == "topbottom") {
-            cv::vconcat(last_lens0_frame_, last_lens1_frame_, combined);
-        } else {
-            // Default: sidebyside
-            cv::hconcat(last_lens0_frame_, last_lens1_frame_, combined);
-        }
-
-        // Publish with stored stamp (preserves trigger GPS time if enabled)
+        // Publish pre-built combined buffer directly (no hconcat/vconcat allocation!)
         std_msgs::Header header;
         header.stamp = last_lens0_stamp_;
         header.frame_id = "x5_combined";
 
-        cv_bridge::CvImage cv_img(header, "bgr8", combined);
+        cv_bridge::CvImage cv_img(header, "bgr8", combined_buffer_);
         pub_combined_.publish(cv_img.toImageMsg());
 
-        // Clear frames
-        last_lens0_frame_.release();
-        last_lens1_frame_.release();
+        // Reset timestamps to indicate frames consumed
+        last_lens0_timestamp_ = -1;
+        last_lens1_timestamp_ = -1;
     }
 
     void publishExposure(const ExposureInfo &exp) {
@@ -677,14 +674,31 @@ private:
     uint64_t lens0_count_ = 0;
     uint64_t lens1_count_ = 0;
 
-    // Frame synchronization for combined image
-    cv::Mat last_lens0_frame_;
-    cv::Mat last_lens1_frame_;
-    double last_lens0_timestamp_ = 0;
-    double last_lens1_timestamp_ = 0;
+    // Frame synchronization for combined image (optimized zero-copy path)
+    cv::Mat combined_buffer_;                   // Pre-allocated buffer for combined image
+    bool combined_buffer_initialized_ = false;
+    double last_lens0_timestamp_ = -1;          // -1 = not set
+    double last_lens1_timestamp_ = -1;          // -1 = not set
     ros::Time last_lens0_stamp_;
     ros::Time last_lens1_stamp_;
     std::mutex frame_sync_mutex_;
+
+    // Helper to lazily initialize combined buffer
+    void ensureCombinedBufferInitialized(const cv::Size& lens_size) {
+        if (combined_buffer_initialized_ &&
+            ((combined_format_ == "topbottom" && combined_buffer_.rows == lens_size.height * 2) ||
+             (combined_format_ != "topbottom" && combined_buffer_.cols == lens_size.width * 2))) {
+            return;
+        }
+
+        if (combined_format_ == "topbottom") {
+            combined_buffer_ = cv::Mat(lens_size.height * 2, lens_size.width, CV_8UC3);
+        } else {
+            combined_buffer_ = cv::Mat(lens_size.height, lens_size.width * 2, CV_8UC3);
+        }
+        combined_buffer_initialized_ = true;
+        ROS_INFO("Initialized combined buffer: %dx%d", combined_buffer_.cols, combined_buffer_.rows);
+    }
 };
 
 // ============================================================================

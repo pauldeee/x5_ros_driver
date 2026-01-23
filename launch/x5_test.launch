@@ -3,7 +3,7 @@
     <!-- Test launch file - preview only, no SD recording -->
     <!-- Use this to verify the camera connection and streaming works -->
     
-    <arg name="preview_resolution" default="1080" doc="Preview resolution: 4k, 2k, 1080, 960"/>
+    <arg name="preview_resolution" default="4k" doc="Preview resolution: 4k, 2k, 1080, 960"/>
 
     <node name="x5_driver" pkg="x5_ros_driver" type="x5_driver_node" output="screen" required="true">
         <rosparam file="$(find x5_ros_driver)/config/x5_params.yaml"/>

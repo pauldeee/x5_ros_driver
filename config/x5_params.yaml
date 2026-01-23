@@ -35,6 +35,6 @@ gps_time_topic: "/ext/time"   # Topic providing GPS time reference
 # Trigger synchronization
 # When enabled, only publish images synchronized with external trigger
 # Images are stamped with trigger's GPS time for lidar correlation
-use_trigger_sync: true
+use_trigger_sync: false
 camera_trigger_topic: "/camera_trigger_time"
 trigger_max_age_sec: 0.15     # Discard triggers older than this (seconds)

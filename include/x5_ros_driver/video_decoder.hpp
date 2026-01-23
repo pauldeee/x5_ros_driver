@@ -3,14 +3,12 @@
 #include <opencv2/opencv.hpp>
 #include <memory>
 #include <mutex>
+#include <cstring>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
-#include <libswscale/swscale.h>
 #include <libavutil/imgutils.h>
-#include <libavutil/opt.h>
-
 }
 
 namespace x5_ros_driver {
@@ -69,16 +67,15 @@ private:
     const AVCodec* codec_ = nullptr;
     AVCodecContext* codec_ctx_ = nullptr;
     AVFrame* frame_ = nullptr;
-    AVFrame* frame_bgr_ = nullptr;
     AVPacket* packet_ = nullptr;
-    SwsContext* sws_ctx_ = nullptr;
 
     // Frame dimensions (set after first decode)
     int width_ = 0;
     int height_ = 0;
 
-    // Buffer for BGR conversion
-    uint8_t* bgr_buffer_ = nullptr;
+    // OpenCV buffers for fast SIMD color conversion
+    cv::Mat yuv_buffer_;       // Contiguous I420 buffer for cvtColor input
+    cv::Mat bgr_buffer_mat_;   // Pre-allocated BGR output
 
     std::mutex mutex_;
 

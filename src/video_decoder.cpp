@@ -14,20 +14,9 @@ VideoDecoder::~VideoDecoder() {
 void VideoDecoder::cleanup() {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    if (sws_ctx_) {
-        sws_freeContext(sws_ctx_);
-        sws_ctx_ = nullptr;
-    }
-
-    if (bgr_buffer_) {
-        av_free(bgr_buffer_);
-        bgr_buffer_ = nullptr;
-    }
-
-    if (frame_bgr_) {
-        av_frame_free(&frame_bgr_);
-        frame_bgr_ = nullptr;
-    }
+    // Release OpenCV buffers
+    yuv_buffer_.release();
+    bgr_buffer_mat_.release();
 
     if (frame_) {
         av_frame_free(&frame_);
@@ -45,6 +34,8 @@ void VideoDecoder::cleanup() {
     }
 
     initialized_ = false;
+    width_ = 0;
+    height_ = 0;
 }
 
 bool VideoDecoder::init(VideoCodecType type) {
@@ -82,6 +73,10 @@ bool VideoDecoder::init(VideoCodecType type) {
     codec_ctx_->refs = 16;  // Allow up to 16 reference frames
     codec_ctx_->err_recognition = 0;  // Be tolerant of errors
 
+    // Enable multi-threaded decoding for better 4K performance
+    codec_ctx_->thread_count = 0;  // 0 = auto-detect optimal thread count
+    codec_ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;  // Use both frame and slice threading
+
     // Open codec
     if (avcodec_open2(codec_ctx_, codec_, nullptr) < 0) {
         std::cerr << "[VideoDecoder] Could not open codec" << std::endl;
@@ -89,11 +84,10 @@ bool VideoDecoder::init(VideoCodecType type) {
         return false;
     }
 
-    // Allocate frames
+    // Allocate frame for decoded YUV
     frame_ = av_frame_alloc();
-    frame_bgr_ = av_frame_alloc();
-    if (!frame_ || !frame_bgr_) {
-        std::cerr << "[VideoDecoder] Could not allocate frames" << std::endl;
+    if (!frame_) {
+        std::cerr << "[VideoDecoder] Could not allocate frame" << std::endl;
         cleanup();
         return false;
     }
@@ -115,58 +109,22 @@ bool VideoDecoder::init(VideoCodecType type) {
 }
 
 bool VideoDecoder::initSwsContext(int width, int height) {
-    // Free existing context if dimensions changed
-    if (sws_ctx_ && (width != width_ || height != height_)) {
-        sws_freeContext(sws_ctx_);
-        sws_ctx_ = nullptr;
-        if (bgr_buffer_) {
-            av_free(bgr_buffer_);
-            bgr_buffer_ = nullptr;
-        }
-    }
-
-    if (sws_ctx_) {
-        return true;  // Already initialized with correct dimensions
+    // Check if dimensions changed
+    if (width == width_ && height == height_ && !yuv_buffer_.empty()) {
+        return true;  // Already initialized
     }
 
     width_ = width;
     height_ = height;
 
-    // Create scaling context for YUV -> BGR conversion
-    sws_ctx_ = sws_getContext(
-        width, height, codec_ctx_->pix_fmt,
-        width, height, AV_PIX_FMT_BGR24,
-        SWS_BILINEAR, nullptr, nullptr, nullptr
-    );
+    // Pre-allocate YUV buffer for OpenCV conversion (I420 format: height * 1.5)
+    yuv_buffer_.create(height + height / 2, width, CV_8UC1);
 
-    // Set color range to suppress deprecated format warning
-    if (sws_ctx_) {
-        av_opt_set_int(sws_ctx_, "src_range", 1, 0);  // Full range
-        av_opt_set_int(sws_ctx_, "dst_range", 1, 0);  // Full range
-    }
+    // Pre-allocate BGR output buffer (avoids allocation in cvtColor)
+    bgr_buffer_mat_.create(height, width, CV_8UC3);
 
-    if (!sws_ctx_) {
-        std::cerr << "[VideoDecoder] Could not create SwsContext" << std::endl;
-        return false;
-    }
-
-    // Allocate BGR buffer
-    int bgr_size = av_image_get_buffer_size(AV_PIX_FMT_BGR24, width, height, 1);
-    bgr_buffer_ = (uint8_t*)av_malloc(bgr_size);
-    if (!bgr_buffer_) {
-        std::cerr << "[VideoDecoder] Could not allocate BGR buffer" << std::endl;
-        return false;
-    }
-
-    // Setup frame_bgr_ with the buffer
-    av_image_fill_arrays(
-        frame_bgr_->data, frame_bgr_->linesize,
-        bgr_buffer_, AV_PIX_FMT_BGR24,
-        width, height, 1
-    );
-
-    std::cout << "[VideoDecoder] Initialized SwsContext for " 
-              << width << "x" << height << std::endl;
+    std::cout << "[VideoDecoder] Initialized OpenCV buffers for "
+              << width << "x" << height << " (using SIMD-optimized cvtColor)" << std::endl;
 
     return true;
 }
@@ -202,21 +160,52 @@ bool VideoDecoder::decode(const uint8_t* data, size_t size, cv::Mat& output) {
         return false;
     }
 
-    // Initialize SwsContext if needed (now we know dimensions)
+    // Initialize buffers if needed (now we know dimensions)
     if (!initSwsContext(frame_->width, frame_->height)) {
         return false;
     }
 
-    // Convert YUV to BGR
-    sws_scale(
-        sws_ctx_,
-        frame_->data, frame_->linesize,
-        0, frame_->height,
-        frame_bgr_->data, frame_bgr_->linesize
-    );
+    // Copy YUV planes to contiguous buffer for OpenCV (I420 format)
+    // This is faster than sws_scale because OpenCV's cvtColor uses SIMD
+    uint8_t* yuv_ptr = yuv_buffer_.data;
+    int y_size = width_ * height_;
+    int uv_width = width_ / 2;
+    int uv_height = height_ / 2;
 
-    // Copy to OpenCV Mat
-    output = cv::Mat(height_, width_, CV_8UC3, frame_bgr_->data[0], frame_bgr_->linesize[0]).clone();
+    // Copy Y plane (handle stride if different from width)
+    if (frame_->linesize[0] == width_) {
+        memcpy(yuv_ptr, frame_->data[0], y_size);
+    } else {
+        for (int i = 0; i < height_; i++) {
+            memcpy(yuv_ptr + i * width_, frame_->data[0] + i * frame_->linesize[0], width_);
+        }
+    }
+    yuv_ptr += y_size;
+
+    // Copy U plane
+    if (frame_->linesize[1] == uv_width) {
+        memcpy(yuv_ptr, frame_->data[1], uv_width * uv_height);
+    } else {
+        for (int i = 0; i < uv_height; i++) {
+            memcpy(yuv_ptr + i * uv_width, frame_->data[1] + i * frame_->linesize[1], uv_width);
+        }
+    }
+    yuv_ptr += uv_width * uv_height;
+
+    // Copy V plane
+    if (frame_->linesize[2] == uv_width) {
+        memcpy(yuv_ptr, frame_->data[2], uv_width * uv_height);
+    } else {
+        for (int i = 0; i < uv_height; i++) {
+            memcpy(yuv_ptr + i * uv_width, frame_->data[2] + i * frame_->linesize[2], uv_width);
+        }
+    }
+
+    // Convert YUV I420 to BGR using OpenCV's SIMD-optimized cvtColor
+    cv::cvtColor(yuv_buffer_, bgr_buffer_mat_, cv::COLOR_YUV2BGR_I420);
+
+    // Clone output (caller may hold reference across decode calls)
+    output = bgr_buffer_mat_.clone();
 
     return true;
 }

@@ -7,6 +7,9 @@
 #include <string>
 #include <vector>
 #include <deque>
+#include <queue>
+#include <thread>
+#include <condition_variable>
 
 #include <camera/camera.h>
 #include <camera/device_discovery.h>
@@ -257,11 +260,13 @@ private:
     std::atomic<bool> streaming_{false};
     std::atomic<bool> recording_{false};
 
-    // Callbacks
+    // Callbacks (separate mutexes to avoid blocking between IMU/video/exposure)
     ImuCallback imu_callback_;
     VideoCallback video_callback_;
     ExposureCallback exposure_callback_;
-    std::mutex callback_mutex_;
+    std::mutex imu_callback_mutex_;
+    std::mutex video_callback_mutex_;
+    std::mutex exposure_callback_mutex_;
 
     // IMU scaling (from diagnostic: accel in g, gyro in rad/s)
     double accel_scale_ = 9.81;  // Convert g to m/s²
@@ -275,6 +280,30 @@ private:
 
     ins_camera::VideoResolution toSdkPreviewResolution(PreviewResolution res);
     ins_camera::VideoResolution toSdkRecordingResolution(RecordingResolution res);
+
+    // ========== Async Decoding ==========
+    // Encoded packet for async queue
+    struct EncodedPacket {
+        std::vector<uint8_t> data;
+        int64_t timestamp;
+        uint8_t stream_type;
+        int stream_index;
+    };
+
+    // Packet queue (thread-safe)
+    std::queue<EncodedPacket> packet_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+    static constexpr size_t MAX_QUEUE_SIZE = 5;  // Limit queue to avoid memory buildup
+
+    // Worker thread
+    std::thread decode_thread_;
+    std::atomic<bool> decode_thread_running_{false};
+
+    void startDecodeThread();
+    void stopDecodeThread();
+    void decodeThreadLoop();
+    void processEncodedPacket(const EncodedPacket& packet);
 };
 
 } // namespace x5_ros_driver
