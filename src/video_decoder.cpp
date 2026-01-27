@@ -91,7 +91,7 @@ bool VideoDecoder::initHwAccel() {
     return true;
 }
 
-bool VideoDecoder::init(VideoCodecType type) {
+bool VideoDecoder::init(VideoCodecType type, bool use_hw_accel) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (initialized_) {
@@ -126,8 +126,8 @@ bool VideoDecoder::init(VideoCodecType type) {
     codec_ctx_->refs = 16;  // Allow up to 16 reference frames
     codec_ctx_->err_recognition = 0;  // Be tolerant of errors
 
-    // Try to enable VAAPI hardware acceleration
-    if (initHwAccel()) {
+    // Try to enable VAAPI hardware acceleration (if requested)
+    if (use_hw_accel && initHwAccel()) {
         codec_ctx_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
         codec_ctx_->get_format = getHwFormat;
         hw_accel_enabled_ = true;

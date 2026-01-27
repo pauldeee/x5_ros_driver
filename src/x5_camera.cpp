@@ -21,21 +21,33 @@ public:
 
     void OnVideoData(const uint8_t* data, size_t size, int64_t timestamp,
                      uint8_t streamType, int stream_index) override {
-        if (parent_) {
-            parent_->onVideoData(data, size, timestamp, streamType, stream_index);
-        }
+        try {
+            if (parent_) {
+                parent_->onVideoData(data, size, timestamp, streamType, stream_index);
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[X5Camera] OnVideoData exception: " << e.what() << std::endl;
+        } catch (...) {}
     }
 
     void OnGyroData(const std::vector<ins_camera::GyroData>& data) override {
-        if (parent_) {
-            parent_->onImuData(data);
-        }
+        try {
+            if (parent_) {
+                parent_->onImuData(data);
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[X5Camera] OnGyroData exception: " << e.what() << std::endl;
+        } catch (...) {}
     }
 
     void OnExposureData(const ins_camera::ExposureData& data) override {
-        if (parent_) {
-            parent_->onExposureData(data.timestamp, data.exposure_time);
-        }
+        try {
+            if (parent_) {
+                parent_->onExposureData(data.timestamp, data.exposure_time);
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[X5Camera] OnExposureData exception: " << e.what() << std::endl;
+        } catch (...) {}
     }
 
 private:
@@ -200,7 +212,8 @@ ins_camera::VideoResolution X5Camera::toSdkRecordingResolution(RecordingResoluti
 
 bool X5Camera::startStreaming(PreviewResolution preview_res,
                                bool start_recording,
-                               RecordingResolution recording_res) {
+                               RecordingResolution recording_res,
+                               bool use_hw_accel) {
     if (!connected_) {
         std::cerr << "[X5Camera] Not connected!" << std::endl;
         return false;
@@ -287,7 +300,7 @@ bool X5Camera::startStreaming(PreviewResolution preview_res,
     VideoCodecType codec_type = (preview_params.encode_type == ins_camera::VideoEncodeType::H264) 
                                  ? VideoCodecType::H264 : VideoCodecType::H265;
     
-    if (!decoder_lens0_->init(codec_type)) {
+    if (!decoder_lens0_->init(codec_type, use_hw_accel)) {
         std::cerr << "[X5Camera] Failed to initialize decoder for lens0" << std::endl;
         if (recording_) {
             camera_->StopRecording();
@@ -296,7 +309,7 @@ bool X5Camera::startStreaming(PreviewResolution preview_res,
         return false;
     }
 
-    if (!decoder_lens1_->init(codec_type)) {
+    if (!decoder_lens1_->init(codec_type, use_hw_accel)) {
         std::cerr << "[X5Camera] Failed to initialize decoder for lens1" << std::endl;
         if (recording_) {
             camera_->StopRecording();
@@ -531,7 +544,13 @@ void X5Camera::decodeThreadLoop() {
         }
 
         // Decode packet and queue result (no callback here - that's publish thread's job)
-        decodePacket(packet);
+        try {
+            decodePacket(packet);
+        } catch (const std::exception& e) {
+            std::cerr << "[X5Camera] Decode exception: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "[X5Camera] Decode unknown exception" << std::endl;
+        }
     }
 
     std::cout << "[X5Camera] Decode thread exiting" << std::endl;
@@ -637,7 +656,13 @@ void X5Camera::publishThreadLoop() {
         }
 
         // Process and publish frame (callback happens here)
-        publishFrame(frame);
+        try {
+            publishFrame(frame);
+        } catch (const std::exception& e) {
+            std::cerr << "[X5Camera] Publish callback exception: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "[X5Camera] Publish callback unknown exception" << std::endl;
+        }
     }
 
     std::cout << "[X5Camera] Publish thread exiting" << std::endl;

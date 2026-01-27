@@ -3,7 +3,7 @@
 # Preview stream resolution for live topics
 # Options: "4k", "2k", "1080", "960"
 # Lower resolution = less CPU usage
-preview_resolution: "4k"
+preview_resolution: "2k"
 
 # SD card recording resolution  
 # Options: "8k", "5.7k"
@@ -14,11 +14,12 @@ recording_resolution: "8k"
 auto_start_recording: false
 
 # Battery monitoring
-battery_poll_interval_sec: 30    # How often to check/publish battery level
-low_battery_threshold_percent: 3  # Auto-save and shutdown below this level
+enable_battery_monitoring: false   # Set false when running on hardwired power (no battery)
+battery_poll_interval_sec: 30     # How often to check/publish battery level
+low_battery_threshold_percent: 5  # Auto-save and shutdown below this level %
 
 # Combined image output (both lenses in one image)
-publish_combined: true
+publish_combined: false
 combined_format: "sidebyside"  # "sidebyside" (2160x1080) or "topbottom" (1080x2160)
 
 # Frame IDs for TF
@@ -26,6 +27,11 @@ lens0_frame_id: "x5_lens0"
 lens1_frame_id: "x5_lens1"
 imu_frame_id: "x5_imu"
 
+
+# Hardware acceleration
+# When true, uses VAAPI (iGPU) for H.264 decode. When false, uses CPU multi-threaded decode.
+# CPU decode avoids occasional VAAPI transfer errors at the cost of higher CPU usage.
+use_hardware_accel: true
 
 # Time synchronization
 sync_time_on_connect: true    # Compute camera→system offset at startup
@@ -37,5 +43,5 @@ gps_time_topic: "/ext/time"   # Topic providing GPS time reference
 # Images are stamped with trigger's GPS time for lidar correlation
 use_trigger_sync: true
 camera_trigger_topic: "/camera_trigger_time"
-trigger_max_age_sec: 0.20               # System-time fallback match window (seconds)
-trigger_gps_match_threshold_ms: 70      # GPS-domain match threshold (ms); >= decode spacing (~66ms at 30fps/2)
+trigger_max_age_sec: 0.15               # System-time fallback match window (seconds)
+trigger_gps_match_threshold_ms: 95      # GPS-domain match threshold (ms); < 100ms trigger period, absorbs 2 frame drops

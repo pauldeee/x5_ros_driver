@@ -38,7 +38,7 @@ public:
      * @param type H264 or H265
      * @return true if initialization successful
      */
-    bool init(VideoCodecType type);
+    bool init(VideoCodecType type, bool use_hw_accel = true);
 
     /**
      * @brief Decode a video packet

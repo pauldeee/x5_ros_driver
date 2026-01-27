@@ -118,7 +118,8 @@ public:
      */
     bool startStreaming(PreviewResolution preview_res = PreviewResolution::RES_1080P,
                         bool start_recording = true,
-                        RecordingResolution recording_res = RecordingResolution::RES_8K);
+                        RecordingResolution recording_res = RecordingResolution::RES_8K,
+                        bool use_hw_accel = true);
 
     /**
      * @brief Stop streaming and recording
@@ -335,7 +336,7 @@ private:
     std::queue<EncodedPacket> packet_queue_;
     std::mutex packet_queue_mutex_;
     std::condition_variable packet_queue_cv_;
-    static constexpr size_t MAX_PACKET_QUEUE_SIZE = 5;
+    static constexpr size_t MAX_PACKET_QUEUE_SIZE = 30;  // ~1s buffer at 30fps; encoded packets are small (~100-500KB)
 
     // Stage 2: Decoded frame queue (decode thread → publish thread)
     struct DecodedFrame {
@@ -347,7 +348,7 @@ private:
     std::queue<DecodedFrame> frame_queue_;
     std::mutex frame_queue_mutex_;
     std::condition_variable frame_queue_cv_;
-    static constexpr size_t MAX_FRAME_QUEUE_SIZE = 4;  // 2 frames worth (lens0+lens1 each)
+    static constexpr size_t MAX_FRAME_QUEUE_SIZE = 30;  // ~1s buffer at 30fps, matches packet queue depth
 
     // Drop counters for diagnostics
     std::atomic<uint64_t> packets_dropped_{0};

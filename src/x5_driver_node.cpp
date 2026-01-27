@@ -28,6 +28,11 @@
 #include <atomic>
 #include <mutex>
 #include <deque>
+#include <thread>
+#include <chrono>
+#include <execinfo.h>
+#include <cxxabi.h>
+#include <cstdlib>
 
 #include "x5_ros_driver/x5_camera.hpp"
 
@@ -38,7 +43,7 @@ using namespace x5_ros_driver;
 // ============================================================================
 
 std::atomic<bool> g_shutdown_requested{false};
-std::unique_ptr <X5Camera> g_camera;
+std::unique_ptr<X5Camera> g_camera;
 
 void signalHandler(int sig) {
     ROS_WARN("Received signal %d, initiating clean shutdown...", sig);
@@ -53,8 +58,7 @@ void signalHandler(int sig) {
 class X5DriverNode {
 public:
     X5DriverNode(ros::NodeHandle &nh, ros::NodeHandle &pnh)
-            : nh_(nh), pnh_(pnh), it_(nh) {
-
+        : nh_(nh), pnh_(pnh), it_(nh) {
         // Load parameters
         loadParameters();
 
@@ -64,8 +68,8 @@ public:
         pub_combined_ = it_.advertise("x5/combined", 1);
         pub_imu_ = nh_.advertise<sensor_msgs::Imu>("x5/imu", 100);
         pub_exposure_ = nh_.advertise<sensor_msgs::TimeReference>("x5/exposure", 10);
-        pub_recording_info_ = nh_.advertise<std_msgs::String>("x5/recording_info", 1, true);  // Latched
-        pub_battery_ = nh_.advertise<std_msgs::Int32>("x5/battery_level", 1, true);  // Latched
+        pub_recording_info_ = nh_.advertise<std_msgs::String>("x5/recording_info", 1, true); // Latched
+        pub_battery_ = nh_.advertise<std_msgs::Int32>("x5/battery_level", 1, true); // Latched
 
         // Create services
         srv_shutdown_ = nh_.advertiseService("x5/shutdown", &X5DriverNode::shutdownCallback, this);
@@ -83,7 +87,7 @@ public:
         // Create camera
         camera_ = std::make_unique<X5Camera>();
         g_camera = std::move(camera_);
-        camera_ = nullptr;  // Use g_camera from now on
+        camera_ = nullptr; // Use g_camera from now on
 
         // Connect to camera
         if (!g_camera->connect()) {
@@ -93,7 +97,8 @@ public:
 
         // Sync camera time to system time
         if (sync_time_on_connect_) {
-            if (g_camera->syncTimeToSystem(100)) {  // 100ms tolerance
+            if (g_camera->syncTimeToSystem(100)) {
+                // 100ms tolerance
                 ROS_INFO("Camera time synchronized to system time");
             } else {
                 ROS_WARN("Camera time sync failed or offset too large - timestamps may be inaccurate");
@@ -136,20 +141,46 @@ public:
             ROS_INFO("Subscribing to camera trigger: %s", camera_trigger_topic_.c_str());
             ROS_INFO("Images will only be published when synchronized with triggers (~10 Hz)");
 
-            // Set frame filter to skip decoding frames that won't match any trigger
-            // This saves significant CPU by not decoding ~20fps of unneeded frames
-            g_camera->setFrameFilter([this](int64_t camera_time_ms) -> bool {
-                return shouldDecodeFrame(camera_time_ms);
+            // Set frame filter to skip cloning frames that won't match any trigger.
+            // The H.264 decode still runs for every frame (required for reference chain),
+            // but the expensive clone (~22MB at 4K) is skipped for ~20/30 frames per second.
+            g_camera->setFrameFilter([this](int64_t timestamp_ms) -> bool {
+                // Convert camera time to system time (atomic read, no mutex needed)
+                int64_t sys_ms = g_camera->cameraTimeToSystemTime(timestamp_ms);
+
+                std::lock_guard<std::mutex> lock(trigger_mutex_);
+
+                if (waiting_for_first_trigger_) {
+                    return false;  // No triggers yet, skip clone
+                }
+
+                // Check if there's an unconsumed trigger at-or-before this frame
+                for (const auto &trigger : trigger_buffer_) {
+                    if (trigger.consumed) continue;
+
+                    int64_t trigger_ms = static_cast<int64_t>(trigger.ros_stamp.sec) * 1000
+                                         + trigger.ros_stamp.nsec / 1000000;
+                    if (sys_ms < trigger_ms) {
+                        return false;  // Frame is before earliest unconsumed trigger
+                    }
+
+                    // Frame is at-or-after this trigger — clone it for matching
+                    return true;
+                }
+
+                // No unconsumed triggers remain — skip
+                return false;
             });
-            ROS_INFO("Frame filter enabled - only decoding frames matching triggers");
         }
 
         // Get battery
-        int battery = g_camera->getBatteryLevel();
-        if (battery >= 0) {
-            ROS_INFO("Battery: %d%%", battery);
-            if (battery < 20) {
-                ROS_WARN("Low battery! %d%%", battery);
+        if (enable_battery_monitoring_) {
+            int battery = g_camera->getBatteryLevel();
+            if (battery >= 0) {
+                ROS_INFO("Battery: %d%%", battery);
+                if (battery < 20) {
+                    ROS_WARN("Low battery! %d%%", battery);
+                }
             }
         }
 
@@ -168,7 +199,7 @@ public:
             rec_res = RecordingResolution::RES_5_7K;
         }
 
-        if (!g_camera->startStreaming(preview_res, auto_start_recording_, rec_res)) {
+        if (!g_camera->startStreaming(preview_res, auto_start_recording_, rec_res, use_hardware_accel_)) {
             ROS_ERROR("Failed to start streaming");
             return false;
         }
@@ -185,19 +216,20 @@ public:
             ROS_INFO("Recording will be saved when node is stopped");
         }
 
-        // Start battery monitoring timer
-        battery_timer_ = nh_.createTimer(
-                ros::Duration(battery_poll_interval_sec_),
-                &X5DriverNode::batteryTimerCallback, this);
-
-        // Publish initial battery level
-        publishBatteryLevel();
+        // Start background thread for periodic SDK tasks (battery monitoring).
+        // The camera→system time offset from initial sync is stable (±3ms drift
+        // observed over minutes), so we don't refresh it during streaming.
+        // Refreshing it requires GetCameraMediaTime() — a synchronous SDK/USB call
+        // that can conflict with the streaming data path and crash the SDK.
+        if (enable_battery_monitoring_) {
+            startTimeRefreshThread();
+        }
 
         return true;
     }
 
     void spin() {
-        ros::Rate rate(100);  // 100 Hz check rate
+        ros::Rate rate(100); // 100 Hz check rate
 
         while (ros::ok() && !g_shutdown_requested && running_) {
             ros::spinOnce();
@@ -205,7 +237,8 @@ public:
 
             // Periodic connection check
             static int counter = 0;
-            if (++counter >= 1000) {  // Every ~10 seconds
+            if (++counter >= 1000) {
+                // Every ~10 seconds
                 counter = 0;
                 if (!g_camera || !g_camera->isConnected()) {
                     ROS_ERROR("Camera disconnected!");
@@ -221,6 +254,7 @@ public:
         }
 
         running_ = false;
+        stopTimeRefreshThread();
         ROS_INFO("Shutting down X5 driver...");
 
         if (g_camera) {
@@ -249,6 +283,7 @@ private:
         pnh_.param<std::string>("preview_resolution", preview_resolution_, "1080");
         pnh_.param<std::string>("recording_resolution", recording_resolution_, "8k");
         pnh_.param<bool>("auto_start_recording", auto_start_recording_, true);
+        pnh_.param<bool>("enable_battery_monitoring", enable_battery_monitoring_, true);
         pnh_.param<int>("battery_poll_interval_sec", battery_poll_interval_sec_, 30);
         pnh_.param<int>("low_battery_threshold_percent", low_battery_threshold_percent_, 15);
         pnh_.param<std::string>("lens0_frame_id", lens0_frame_id_, "x5_lens0");
@@ -263,13 +298,18 @@ private:
         pnh_.param<std::string>("camera_trigger_topic", camera_trigger_topic_, "/camera_trigger_time");
         pnh_.param<double>("trigger_max_age_sec", trigger_max_age_sec_, 0.20);
         pnh_.param<int>("trigger_gps_match_threshold_ms", trigger_gps_match_threshold_ms_, 70);
+        pnh_.param<bool>("use_hardware_accel", use_hardware_accel_, true);
 
         ROS_INFO("Parameters:");
         ROS_INFO("  preview_resolution: %s", preview_resolution_.c_str());
         ROS_INFO("  recording_resolution: %s", recording_resolution_.c_str());
         ROS_INFO("  auto_start_recording: %s", auto_start_recording_ ? "true" : "false");
-        ROS_INFO("  battery_poll_interval_sec: %d", battery_poll_interval_sec_);
-        ROS_INFO("  low_battery_threshold_percent: %d%%", low_battery_threshold_percent_);
+        ROS_INFO("  enable_battery_monitoring: %s", enable_battery_monitoring_ ? "true" : "false");
+        if (enable_battery_monitoring_) {
+            ROS_INFO("  battery_poll_interval_sec: %d", battery_poll_interval_sec_);
+            ROS_INFO("  low_battery_threshold_percent: %d%%", low_battery_threshold_percent_);
+        }
+        ROS_INFO("  use_hardware_accel: %s", use_hardware_accel_ ? "true" : "false");
         ROS_INFO("  sync_time_on_connect: %s", sync_time_on_connect_ ? "true" : "false");
         ROS_INFO("  use_gps_time: %s", use_gps_time_ ? "true" : "false");
         if (use_gps_time_) {
@@ -303,7 +343,7 @@ private:
         msg.linear_acceleration.z = imu.az;
 
         // Covariance unknown
-        msg.orientation_covariance[0] = -1;  // Orientation not provided
+        msg.orientation_covariance[0] = -1; // Orientation not provided
         msg.angular_velocity_covariance[0] = 0;
         msg.linear_acceleration_covariance[0] = 0;
 
@@ -324,12 +364,21 @@ private:
         frame_sys_time.sec = system_time_ms / 1000;
         frame_sys_time.nsec = (system_time_ms % 1000) * 1000000;
 
-        ros::Time stamp = frame_sys_time;  // Default: use system time
+        ros::Time stamp = frame_sys_time; // Default: use system time
         bool should_publish = true;
 
-        // Trigger synchronization logic
+        // Trigger synchronization logic: forced 1:1 matching.
+        // Every trigger MUST produce one image (the first frame at-or-after the trigger).
+        // No threshold, no stale triggers — at 30fps there's always a frame within 33ms.
         if (use_trigger_sync_) {
-            std::lock_guard <std::mutex> lock(trigger_mutex_);
+            // Compute GPS time OUTSIDE trigger_mutex_ to avoid nested lock contention
+            int64_t frame_gps_ms = 0;
+            bool have_gps = g_camera && g_camera->isGpsTimeOffsetValid();
+            if (have_gps) {
+                frame_gps_ms = g_camera->cameraTimeToGpsTime(static_cast<int64_t>(frame.timestamp_ms));
+            }
+
+            std::lock_guard<std::mutex> lock(trigger_mutex_);
 
             // Before first trigger: discard all frames
             if (waiting_for_first_trigger_) {
@@ -337,92 +386,49 @@ private:
                 return;
             }
 
-            // Dual-mode trigger matching (one-sided: first frame at-or-after trigger).
-            // GPS mode: match frame GPS time against trigger GPS time
-            // SYS mode (fallback): match frame system time against trigger ROS time
-            //
-            // One-sided prevents earlier frames from "stealing" later triggers.
-            // At 30fps the first frame after each 10Hz trigger is within 0-33ms.
-            bool use_gps_matching = g_camera && g_camera->isGpsTimeOffsetValid();
-
+            // Find oldest unconsumed trigger where this frame is at-or-after trigger time.
+            // Match unconditionally — forced 1:1 pairing.
             TriggerInfo *matched_trigger = nullptr;
-            int64_t match_distance_ms = 0;
-            std::string match_mode;
 
-            if (use_gps_matching) {
-                // GPS-domain: first unconsumed trigger where frame is at-or-after trigger
-                int64_t frame_gps_ms = g_camera->cameraTimeToGpsTime(static_cast<int64_t>(frame.timestamp_ms));
+            for (size_t i = 0; i < trigger_buffer_.size(); i++) {
+                TriggerInfo &trigger = trigger_buffer_[i];
+                if (trigger.consumed) continue;
 
-                for (size_t i = 0; i < trigger_buffer_.size(); i++) {
-                    TriggerInfo &trigger = trigger_buffer_[i];
-                    if (trigger.consumed) continue;
-
+                if (have_gps) {
+                    // GPS-domain matching
                     int64_t diff_ms = frame_gps_ms - trigger.gps_stamp_ms;
-
-                    // Frame is before this trigger — not yet, stop searching
-                    // (triggers are chronological, so all later triggers are even further ahead)
-                    if (diff_ms < 0) break;
-
-                    // Frame is after trigger — check if within threshold
-                    if (diff_ms <= trigger_gps_match_threshold_ms_) {
-                        matched_trigger = &trigger;
-                        match_distance_ms = diff_ms;
-                        break;
-                    }
-
-                    // Frame is too far past this trigger — mark stale and continue
-                    trigger.consumed = true;
-                }
-
-                match_mode = "[GPS]";
-
-                // Stamp with frame's own GPS time (camera capture time in GPS domain)
-                if (matched_trigger) {
-                    stamp.sec = frame_gps_ms / 1000;
-                    stamp.nsec = (frame_gps_ms % 1000) * 1000000;
-                }
-            } else {
-                // System-time fallback: first unconsumed trigger where frame is at-or-after
-                for (size_t i = 0; i < trigger_buffer_.size(); i++) {
-                    TriggerInfo &trigger = trigger_buffer_[i];
-                    if (trigger.consumed) continue;
-
+                    if (diff_ms < 0) break;  // Frame is before this trigger — stop
+                    matched_trigger = &trigger;
+                } else {
+                    // System-time fallback
                     double diff_sec = (frame_sys_time - trigger.ros_stamp).toSec();
-
-                    // Frame is before this trigger — stop
                     if (diff_sec < 0) break;
-
-                    // Frame is after trigger — check if within threshold
-                    if (diff_sec <= trigger_max_age_sec_) {
-                        matched_trigger = &trigger;
-                        match_distance_ms = static_cast<int64_t>(diff_sec * 1000.0);
-                        break;
-                    }
-
-                    // Frame is too far past this trigger — mark stale
-                    trigger.consumed = true;
+                    matched_trigger = &trigger;
                 }
-
-                match_mode = "[SYS]";
-
-                // Stamp with trigger GPS time + capture offset
-                if (matched_trigger) {
-                    ros::Duration capture_offset = frame_sys_time - matched_trigger->ros_stamp;
-                    stamp = matched_trigger->gps_stamp + capture_offset;
-                }
+                break;  // Take the first eligible trigger
             }
 
             if (matched_trigger) {
+                // Stamp with frame's GPS time (camera capture time in GPS domain)
+                if (have_gps) {
+                    stamp.sec = frame_gps_ms / 1000;
+                    stamp.nsec = (frame_gps_ms % 1000) * 1000000;
+                } else {
+                    // Fallback: use trigger GPS time + capture offset
+                    ros::Duration capture_offset = frame_sys_time - matched_trigger->ros_stamp;
+                    stamp = matched_trigger->gps_stamp + capture_offset;
+                }
+
                 if (frames_matched_ == 0) {
-                    ROS_INFO("FIRST trigger match %s: distance=%ldms | "
+                    const char *mode = have_gps ? "[GPS]" : "[SYS]";
+                    ROS_INFO("FIRST trigger match %s: "
                              "frame_sys=%.3f trigger_ros=%.3f trigger_gps=%.3f | "
                              "cam_offset=%ld gps_offset=%s",
-                             match_mode.c_str(), match_distance_ms,
+                             mode,
                              frame_sys_time.toSec(), matched_trigger->ros_stamp.toSec(),
                              matched_trigger->gps_stamp.toSec(),
                              g_camera ? g_camera->getTimeOffset() : 0,
-                             (g_camera && g_camera->isGpsTimeOffsetValid()) ?
-                                 std::to_string(g_camera->getGpsTimeOffset()).c_str() : "N/A");
+                             have_gps ? std::to_string(g_camera->getGpsTimeOffset()).c_str() : "N/A");
                 }
 
                 // Mark trigger consumed only after lens1 (stream_index == 1)
@@ -481,9 +487,11 @@ private:
                 ensureCombinedBufferInitialized(frame.image.size());
                 // Copy directly into right/bottom region of combined buffer (avoids intermediate clone)
                 if (combined_format_ == "topbottom") {
-                    frame.image.copyTo(combined_buffer_(cv::Rect(0, frame.image.rows, frame.image.cols, frame.image.rows)));
+                    frame.image.copyTo(
+                        combined_buffer_(cv::Rect(0, frame.image.rows, frame.image.cols, frame.image.rows)));
                 } else {
-                    frame.image.copyTo(combined_buffer_(cv::Rect(frame.image.cols, 0, frame.image.cols, frame.image.rows)));
+                    frame.image.copyTo(
+                        combined_buffer_(cv::Rect(frame.image.cols, 0, frame.image.cols, frame.image.rows)));
                 }
                 last_lens1_timestamp_ = frame.timestamp_ms;
                 last_lens1_stamp_ = stamp;
@@ -500,16 +508,21 @@ private:
         if (++log_counter >= 300) {
             log_counter = 0;
             if (use_trigger_sync_) {
-                const char* mode = (g_camera && g_camera->isGpsTimeOffsetValid()) ? "[GPS]" : "[SYS]";
-                ROS_INFO("Sync stats %s - triggers: %lu, matched: %lu, discarded: %lu | "
-                         "lens0: %lu, lens1: %lu, imu: %lu | cam_offset: %ld ms | "
-                         "gps_offset: %s",
+                const char *mode = (g_camera && g_camera->isGpsTimeOffsetValid()) ? "[GPS]" : "[SYS]";
+                uint64_t pkt_drop = g_camera ? g_camera->getPacketsDropped() : 0;
+                uint64_t frm_drop = g_camera ? g_camera->getFramesDropped() : 0;
+                ROS_INFO("Sync stats %s - triggers: %lu, matched: %lu, discarded_frames: %lu | "
+                         "lens0: %lu, lens1: %lu, imu: %lu | "
+                         "pkt_drop: %lu, frm_drop: %lu | "
+                         "cam_offset: %ld ms | gps_offset: %s",
                          mode,
                          triggers_received_, frames_matched_, frames_discarded_,
                          lens0_count_, lens1_count_, imu_count_,
+                         pkt_drop, frm_drop,
                          g_camera ? g_camera->getTimeOffset() : 0,
-                         (g_camera && g_camera->isGpsTimeOffsetValid()) ?
-                             std::to_string(g_camera->getGpsTimeOffset()).c_str() : "N/A");
+                         (g_camera && g_camera->isGpsTimeOffsetValid())
+                             ? std::to_string(g_camera->getGpsTimeOffset()).c_str()
+                             : "N/A");
             } else {
                 ROS_INFO("Published - lens0: %lu, lens1: %lu, imu: %lu",
                          lens0_count_, lens1_count_, imu_count_);
@@ -594,10 +607,6 @@ private:
         }
     }
 
-    void batteryTimerCallback(const ros::TimerEvent &event) {
-        publishBatteryLevel();
-    }
-
     bool shutdownCallback(std_srvs::Trigger::Request &req,
                           std_srvs::Trigger::Response &res) {
         ROS_INFO("Shutdown service called");
@@ -647,21 +656,19 @@ private:
                               + msg->time_ref.nsec / 1000000;
 
         g_camera->setGpsTimeOffset(system_time_ms, gps_time_ms);
-
-        // Refresh camera→system offset to track clock drift.
-        // Without this, the static offset computed at startup goes stale
-        // and frame GPS times diverge from trigger GPS times.
-        g_camera->refreshTimeOffset();
+        // Note: refreshTimeOffset() runs on a background thread to avoid
+        // blocking spinOnce() with a synchronous SDK USB call, which would
+        // delay trigger callback delivery and cause stale triggers.
     }
 
     void cameraTriggerCallback(const sensor_msgs::TimeReference::ConstPtr &msg) {
-        std::lock_guard <std::mutex> lock(trigger_mutex_);
+        std::lock_guard<std::mutex> lock(trigger_mutex_);
 
         TriggerInfo trigger;
         trigger.ros_stamp = msg->header.stamp;
         trigger.gps_stamp = msg->time_ref;
         trigger.gps_stamp_ms = static_cast<int64_t>(msg->time_ref.sec) * 1000
-                             + msg->time_ref.nsec / 1000000;
+                               + msg->time_ref.nsec / 1000000;
         trigger.consumed = false;
 
         trigger_buffer_.push_back(trigger);
@@ -678,38 +685,33 @@ private:
         }
     }
 
-    /**
-     * @brief Check if a frame should be decoded based on trigger cadence.
-     *
-     * Uses cadence-based filtering (decode every other frame, ~15fps) instead of
-     * timestamp-matching against triggers. This eliminates a race condition where
-     * the trigger ROS message arrives AFTER the matching frame has already been
-     * rejected by the decode filter (the trigger and frame travel through different
-     * paths: ROS subscriber vs SDK→packet_queue→decode_thread).
-     *
-     * At 30fps input, every-other-frame gives ~66ms spacing. With 10Hz triggers
-     * (100ms apart), every trigger period is guaranteed at least one decoded frame.
-     * The actual frame→trigger pairing happens in publishVideo() using GPS timestamps.
-     */
-    bool shouldDecodeFrame(int64_t camera_time_ms) {
-        std::lock_guard<std::mutex> lock(trigger_mutex_);
+    void startTimeRefreshThread() {
+        time_refresh_running_ = true;
+        time_refresh_thread_ = std::thread([this]() {
+            while (time_refresh_running_) {
+                try {
+                    if (g_camera && g_camera->isConnected()) {
+                        publishBatteryLevel();
+                    }
+                } catch (const std::exception& e) {
+                    ROS_WARN_THROTTLE(10, "Background SDK call failed: %s", e.what());
+                } catch (...) {
+                    ROS_WARN_THROTTLE(10, "Background SDK call failed (unknown exception)");
+                }
+                // Sleep for battery_poll_interval, checking for shutdown every 50ms
+                int sleep_iters = battery_poll_interval_sec_ * 20;  // 50ms per iter
+                for (int i = 0; i < sleep_iters && time_refresh_running_; i++) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
+            }
+        });
+    }
 
-        // Before first trigger: don't decode anything
-        if (waiting_for_first_trigger_) {
-            return false;
+    void stopTimeRefreshThread() {
+        time_refresh_running_ = false;
+        if (time_refresh_thread_.joinable()) {
+            time_refresh_thread_.join();
         }
-
-        // Cadence-based: decode if >=60ms since last decode (camera time domain).
-        // At 30fps (33ms spacing), this decodes every other frame = ~15fps.
-        // Avoids the race condition of timestamp-based trigger matching in the
-        // decode thread, while still saving ~50% of decode work vs unfiltered.
-        int64_t elapsed = camera_time_ms - last_decoded_camera_time_ms_;
-        if (elapsed >= 60 || last_decoded_camera_time_ms_ == 0) {
-            last_decoded_camera_time_ms_ = camera_time_ms;
-            return true;
-        }
-
-        return false;
     }
 
     // ROS
@@ -729,16 +731,14 @@ private:
     // Services
     ros::ServiceServer srv_shutdown_;
 
-    // Timers
-    ros::Timer battery_timer_;
-
     // Camera
-    std::unique_ptr <X5Camera> camera_;
+    std::unique_ptr<X5Camera> camera_;
 
     // Parameters
     std::string preview_resolution_;
     std::string recording_resolution_;
     bool auto_start_recording_;
+    bool enable_battery_monitoring_;
     int battery_poll_interval_sec_;
     int low_battery_threshold_percent_;
     std::string lens0_frame_id_;
@@ -747,6 +747,7 @@ private:
     bool publish_combined_;
     std::string combined_format_;
     bool sync_time_on_connect_;
+    bool use_hardware_accel_;
 
     // GPS time sync
     bool use_gps_time_;
@@ -757,20 +758,20 @@ private:
     bool use_trigger_sync_;
     std::string camera_trigger_topic_;
     double trigger_max_age_sec_;
-    int trigger_gps_match_threshold_ms_ = 70;
+    int trigger_gps_match_threshold_ms_ = 95;
     ros::Subscriber sub_camera_trigger_;
 
     // Trigger state (protected by trigger_mutex_)
     struct TriggerInfo {
-        ros::Time ros_stamp;   // header.stamp - ROS time when trigger arrived
-        ros::Time gps_stamp;   // time_ref - GPS time to stamp the image
-        int64_t gps_stamp_ms;  // time_ref in milliseconds for fast arithmetic
-        bool consumed;         // Whether this trigger has been used
+        ros::Time ros_stamp; // header.stamp - ROS time when trigger arrived
+        ros::Time gps_stamp; // time_ref - GPS time to stamp the image
+        int64_t gps_stamp_ms; // time_ref in milliseconds for fast arithmetic
+        bool consumed; // Whether this trigger has been used
     };
-    std::deque <TriggerInfo> trigger_buffer_;
+
+    std::deque<TriggerInfo> trigger_buffer_;
     std::mutex trigger_mutex_;
     bool waiting_for_first_trigger_ = true;
-    int64_t last_decoded_camera_time_ms_ = 0;  // Cadence tracking for shouldDecodeFrame
 
     // Trigger sync stats
     uint64_t triggers_received_ = 0;
@@ -780,6 +781,8 @@ private:
     // State
     std::atomic<bool> running_{false};
     std::atomic<bool> low_battery_triggered_{false};
+    std::atomic<bool> time_refresh_running_{false};
+    std::thread time_refresh_thread_;
 
     // Stats
     uint64_t imu_count_ = 0;
@@ -787,16 +790,16 @@ private:
     uint64_t lens1_count_ = 0;
 
     // Frame synchronization for combined image (optimized zero-copy path)
-    cv::Mat combined_buffer_;                   // Pre-allocated buffer for combined image
+    cv::Mat combined_buffer_; // Pre-allocated buffer for combined image
     bool combined_buffer_initialized_ = false;
-    double last_lens0_timestamp_ = -1;          // -1 = not set
-    double last_lens1_timestamp_ = -1;          // -1 = not set
+    double last_lens0_timestamp_ = -1; // -1 = not set
+    double last_lens1_timestamp_ = -1; // -1 = not set
     ros::Time last_lens0_stamp_;
     ros::Time last_lens1_stamp_;
     std::mutex frame_sync_mutex_;
 
     // Helper to lazily initialize combined buffer
-    void ensureCombinedBufferInitialized(const cv::Size& lens_size) {
+    void ensureCombinedBufferInitialized(const cv::Size &lens_size) {
         if (combined_buffer_initialized_ &&
             ((combined_format_ == "topbottom" && combined_buffer_.rows == lens_size.height * 2) ||
              (combined_format_ != "topbottom" && combined_buffer_.cols == lens_size.width * 2))) {
@@ -817,7 +820,36 @@ private:
 // Main
 // ============================================================================
 
+void terminateHandler() {
+    std::cerr << "\n=== TERMINATE HANDLER ===" << std::endl;
+
+    // Print current exception info
+    if (auto eptr = std::current_exception()) {
+        try {
+            std::rethrow_exception(eptr);
+        } catch (const std::exception& e) {
+            std::cerr << "Exception: " << e.what() << std::endl;
+        } catch (...) {
+            std::cerr << "Unknown exception" << std::endl;
+        }
+    }
+
+    // Print stack trace
+    void* frames[64];
+    int count = backtrace(frames, 64);
+    char** symbols = backtrace_symbols(frames, count);
+    std::cerr << "Stack trace (" << count << " frames):" << std::endl;
+    for (int i = 0; i < count; i++) {
+        std::cerr << "  [" << i << "] " << symbols[i] << std::endl;
+    }
+    free(symbols);
+
+    std::cerr << "=== END TERMINATE HANDLER ===\n" << std::endl;
+    std::abort();
+}
+
 int main(int argc, char **argv) {
+    std::set_terminate(terminateHandler);
     ros::init(argc, argv, "x5_driver_node", ros::init_options::NoSigintHandler);
 
     // Setup signal handlers for clean shutdown

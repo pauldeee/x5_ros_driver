@@ -119,6 +119,9 @@ target_link_libraries(x5_driver_node
   ${catkin_LIBRARIES}
 )
 
+# Enable symbol names in stack traces for debugging
+target_link_options(x5_driver_node PRIVATE -rdynamic)
+
 #############
 ## Install ##
 #############
