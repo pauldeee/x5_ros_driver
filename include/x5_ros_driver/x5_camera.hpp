@@ -53,6 +53,14 @@ using VideoCallback = std::function<void(const VideoFrame&)>;
 using ExposureCallback = std::function<void(const ExposureInfo&)>;
 
 /**
+ * @brief Frame filter callback - return true to decode frame, false to skip
+ * Called before decoding to allow skipping frames (e.g., for trigger sync)
+ * @param timestamp_ms Camera timestamp of the frame
+ * @return true to decode this frame, false to skip it
+ */
+using FrameFilterCallback = std::function<bool(int64_t timestamp_ms)>;
+
+/**
  * @brief Resolution options for preview stream
  */
 enum class PreviewResolution {
@@ -142,6 +150,13 @@ public:
      * @brief Set callback for exposure data
      */
     void setExposureCallback(ExposureCallback callback);
+
+    /**
+     * @brief Set frame filter callback (called before decoding)
+     * Use this to skip decoding frames that won't be needed (e.g., trigger sync mode)
+     * If not set, all frames are decoded.
+     */
+    void setFrameFilter(FrameFilterCallback filter);
 
     /**
      * @brief Get camera info
@@ -264,9 +279,11 @@ private:
     ImuCallback imu_callback_;
     VideoCallback video_callback_;
     ExposureCallback exposure_callback_;
+    FrameFilterCallback frame_filter_;  // Optional: skip frames before decoding
     std::mutex imu_callback_mutex_;
     std::mutex video_callback_mutex_;
     std::mutex exposure_callback_mutex_;
+    std::mutex frame_filter_mutex_;
 
     // IMU scaling (from diagnostic: accel in g, gyro in rad/s)
     double accel_scale_ = 9.81;  // Convert g to m/s²
@@ -281,8 +298,8 @@ private:
     ins_camera::VideoResolution toSdkPreviewResolution(PreviewResolution res);
     ins_camera::VideoResolution toSdkRecordingResolution(RecordingResolution res);
 
-    // ========== Async Decoding ==========
-    // Encoded packet for async queue
+    // ========== Async Decoding Pipeline ==========
+    // Stage 1: Encoded packet queue (SDK callback → decode thread)
     struct EncodedPacket {
         std::vector<uint8_t> data;
         int64_t timestamp;
@@ -290,20 +307,38 @@ private:
         int stream_index;
     };
 
-    // Packet queue (thread-safe)
     std::queue<EncodedPacket> packet_queue_;
-    std::mutex queue_mutex_;
-    std::condition_variable queue_cv_;
-    static constexpr size_t MAX_QUEUE_SIZE = 5;  // Limit queue to avoid memory buildup
+    std::mutex packet_queue_mutex_;
+    std::condition_variable packet_queue_cv_;
+    static constexpr size_t MAX_PACKET_QUEUE_SIZE = 5;
 
-    // Worker thread
+    // Stage 2: Decoded frame queue (decode thread → publish thread)
+    struct DecodedFrame {
+        cv::Mat image;          // Full decoded BGR frame
+        int64_t timestamp;
+        int stream_index;
+    };
+
+    std::queue<DecodedFrame> frame_queue_;
+    std::mutex frame_queue_mutex_;
+    std::condition_variable frame_queue_cv_;
+    static constexpr size_t MAX_FRAME_QUEUE_SIZE = 4;  // 2 frames worth (lens0+lens1 each)
+
+    // Worker threads
     std::thread decode_thread_;
+    std::thread publish_thread_;
     std::atomic<bool> decode_thread_running_{false};
+    std::atomic<bool> publish_thread_running_{false};
 
     void startDecodeThread();
     void stopDecodeThread();
     void decodeThreadLoop();
-    void processEncodedPacket(const EncodedPacket& packet);
+    void decodePacket(const EncodedPacket& packet);
+
+    void startPublishThread();
+    void stopPublishThread();
+    void publishThreadLoop();
+    void publishFrame(const DecodedFrame& frame);
 };
 
 } // namespace x5_ros_driver

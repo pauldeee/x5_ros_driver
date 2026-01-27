@@ -26,6 +26,14 @@ pkg_check_modules(LIBAV REQUIRED
   libavutil
 )
 
+## Find VA-API (for hardware acceleration headers)
+pkg_check_modules(LIBVA libva libva-drm)
+if(LIBVA_FOUND)
+  message(STATUS "VA-API found - hardware acceleration enabled")
+else()
+  message(STATUS "VA-API not found - using software decoding only")
+endif()
+
 ## Find libusb
 pkg_check_modules(LIBUSB REQUIRED libusb-1.0)
 
@@ -84,6 +92,7 @@ include_directories(
   ${catkin_INCLUDE_DIRS}
   ${OpenCV_INCLUDE_DIRS}
   ${LIBAV_INCLUDE_DIRS}
+  ${LIBVA_INCLUDE_DIRS}
   ${LIBUSB_INCLUDE_DIRS}
   ${INSTA360_SDK_PATH}/include
 )

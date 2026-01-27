@@ -1,12 +1,18 @@
 #include "x5_ros_driver/video_decoder.hpp"
 #include <iostream>
 
+// Static pointer for get_format callback (VAAPI requires this pattern)
+static enum AVPixelFormat s_hw_pix_fmt = AV_PIX_FMT_NONE;
+
 namespace x5_ros_driver {
 
 VideoDecoder::VideoDecoder() {
     // Nothing to do - init() must be called
 }
 
+
+
+    // FIS
 VideoDecoder::~VideoDecoder() {
     cleanup();
 }
@@ -16,7 +22,14 @@ void VideoDecoder::cleanup() {
 
     // Release OpenCV buffers
     yuv_buffer_.release();
-    bgr_buffer_mat_.release();
+    nv12_buffer_.release();
+    bgr_buffers_[0].release();
+    bgr_buffers_[1].release();
+
+    if (sw_frame_) {
+        av_frame_free(&sw_frame_);
+        sw_frame_ = nullptr;
+    }
 
     if (frame_) {
         av_frame_free(&frame_);
@@ -33,9 +46,49 @@ void VideoDecoder::cleanup() {
         codec_ctx_ = nullptr;
     }
 
+    if (hw_device_ctx_) {
+        av_buffer_unref(&hw_device_ctx_);
+        hw_device_ctx_ = nullptr;
+    }
+
+    hw_accel_enabled_ = false;
+    hw_pix_fmt_ = AV_PIX_FMT_NONE;
     initialized_ = false;
     width_ = 0;
     height_ = 0;
+    current_buffer_ = 0;
+}
+
+enum AVPixelFormat VideoDecoder::getHwFormat(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts) {
+    // Callback to select hardware pixel format
+    for (const enum AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+        if (*p == s_hw_pix_fmt) {
+            return *p;
+        }
+    }
+    std::cerr << "[VideoDecoder] Failed to get HW surface format, falling back to SW" << std::endl;
+    return AV_PIX_FMT_NONE;
+}
+
+bool VideoDecoder::initHwAccel() {
+    // Try to create VAAPI device context
+    int ret = av_hwdevice_ctx_create(&hw_device_ctx_,
+                                      AV_HWDEVICE_TYPE_VAAPI,
+                                      "/dev/dri/renderD128",
+                                      nullptr, 0);
+    if (ret < 0) {
+        char errbuf[256];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        std::cerr << "[VideoDecoder] VAAPI init failed: " << errbuf
+                  << " - using CPU decode" << std::endl;
+        return false;
+    }
+
+    hw_pix_fmt_ = AV_PIX_FMT_VAAPI;
+    s_hw_pix_fmt = AV_PIX_FMT_VAAPI;  // Set static for callback
+
+    std::cout << "[VideoDecoder] VAAPI hardware acceleration initialized" << std::endl;
+    return true;
 }
 
 bool VideoDecoder::init(VideoCodecType type) {
@@ -73,9 +126,18 @@ bool VideoDecoder::init(VideoCodecType type) {
     codec_ctx_->refs = 16;  // Allow up to 16 reference frames
     codec_ctx_->err_recognition = 0;  // Be tolerant of errors
 
-    // Enable multi-threaded decoding for better 4K performance
-    codec_ctx_->thread_count = 0;  // 0 = auto-detect optimal thread count
-    codec_ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;  // Use both frame and slice threading
+    // Try to enable VAAPI hardware acceleration
+    if (initHwAccel()) {
+        codec_ctx_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
+        codec_ctx_->get_format = getHwFormat;
+        hw_accel_enabled_ = true;
+        // Note: threading is handled by VAAPI driver, not needed for HW decode
+    } else {
+        // Fallback: Enable multi-threaded decoding for CPU
+        codec_ctx_->thread_count = 0;  // 0 = auto-detect optimal thread count
+        codec_ctx_->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+        hw_accel_enabled_ = false;
+    }
 
     // Open codec
     if (avcodec_open2(codec_ctx_, codec_, nullptr) < 0) {
@@ -84,12 +146,22 @@ bool VideoDecoder::init(VideoCodecType type) {
         return false;
     }
 
-    // Allocate frame for decoded YUV
+    // Allocate frame for decoded YUV (or VAAPI surface)
     frame_ = av_frame_alloc();
     if (!frame_) {
         std::cerr << "[VideoDecoder] Could not allocate frame" << std::endl;
         cleanup();
         return false;
+    }
+
+    // Allocate SW frame for HW→SW transfer (if using VAAPI)
+    if (hw_accel_enabled_) {
+        sw_frame_ = av_frame_alloc();
+        if (!sw_frame_) {
+            std::cerr << "[VideoDecoder] Could not allocate SW frame" << std::endl;
+            cleanup();
+            return false;
+        }
     }
 
     // Allocate packet
@@ -101,30 +173,41 @@ bool VideoDecoder::init(VideoCodecType type) {
     }
 
     initialized_ = true;
-    std::cout << "[VideoDecoder] Initialized " 
-              << (type == VideoCodecType::H264 ? "H.264" : "H.265") 
-              << " decoder" << std::endl;
+    std::cout << "[VideoDecoder] Initialized "
+              << (type == VideoCodecType::H264 ? "H.264" : "H.265")
+              << " decoder"
+              << (hw_accel_enabled_ ? " with VAAPI hardware acceleration" : " (CPU)")
+              << std::endl;
 
     return true;
 }
 
 bool VideoDecoder::initSwsContext(int width, int height) {
     // Check if dimensions changed
-    if (width == width_ && height == height_ && !yuv_buffer_.empty()) {
+    if (width == width_ && height == height_ && !bgr_buffers_[0].empty()) {
         return true;  // Already initialized
     }
 
     width_ = width;
     height_ = height;
 
-    // Pre-allocate YUV buffer for OpenCV conversion (I420 format: height * 1.5)
-    yuv_buffer_.create(height + height / 2, width, CV_8UC1);
+    if (hw_accel_enabled_) {
+        // VAAPI outputs NV12 format: Y plane + interleaved UV plane
+        // NV12 total size = height * 1.5
+        nv12_buffer_.create(height + height / 2, width, CV_8UC1);
+    } else {
+        // CPU decode outputs I420 format: Y plane + U plane + V plane
+        yuv_buffer_.create(height + height / 2, width, CV_8UC1);
+    }
 
-    // Pre-allocate BGR output buffer (avoids allocation in cvtColor)
-    bgr_buffer_mat_.create(height, width, CV_8UC3);
+    // Pre-allocate double-buffered BGR output (eliminates clone overhead)
+    bgr_buffers_[0].create(height, width, CV_8UC3);
+    bgr_buffers_[1].create(height, width, CV_8UC3);
 
     std::cout << "[VideoDecoder] Initialized OpenCV buffers for "
-              << width << "x" << height << " (using SIMD-optimized cvtColor)" << std::endl;
+              << width << "x" << height
+              << (hw_accel_enabled_ ? " (NV12 from VAAPI)" : " (I420 from CPU)")
+              << " with double-buffering" << std::endl;
 
     return true;
 }
@@ -160,52 +243,114 @@ bool VideoDecoder::decode(const uint8_t* data, size_t size, cv::Mat& output) {
         return false;
     }
 
+    // Pointer to the frame we'll convert (may be HW or SW frame)
+    AVFrame* src_frame = frame_;
+
+    // If using hardware acceleration, transfer from GPU to system memory
+    if (hw_accel_enabled_ && frame_->format == hw_pix_fmt_) {
+        // Release previous sw_frame data before transfer
+        av_frame_unref(sw_frame_);
+
+        ret = av_hwframe_transfer_data(sw_frame_, frame_, 0);
+        if (ret < 0) {
+            char errbuf[256];
+            av_strerror(ret, errbuf, sizeof(errbuf));
+            std::cerr << "[VideoDecoder] HW frame transfer failed: " << errbuf << std::endl;
+            av_frame_unref(frame_);
+            return false;
+        }
+        src_frame = sw_frame_;
+    }
+
     // Initialize buffers if needed (now we know dimensions)
-    if (!initSwsContext(frame_->width, frame_->height)) {
+    if (!initSwsContext(src_frame->width, src_frame->height)) {
+        av_frame_unref(frame_);
+        if (hw_accel_enabled_) av_frame_unref(sw_frame_);
         return false;
     }
 
-    // Copy YUV planes to contiguous buffer for OpenCV (I420 format)
-    // This is faster than sws_scale because OpenCV's cvtColor uses SIMD
-    uint8_t* yuv_ptr = yuv_buffer_.data;
-    int y_size = width_ * height_;
-    int uv_width = width_ / 2;
-    int uv_height = height_ / 2;
+    // Use double-buffering: write to current buffer, return it to caller
+    // Caller's previous frame (from last decode) is in the other buffer, still valid
+    cv::Mat& bgr_buffer = bgr_buffers_[current_buffer_];
 
-    // Copy Y plane (handle stride if different from width)
-    if (frame_->linesize[0] == width_) {
-        memcpy(yuv_ptr, frame_->data[0], y_size);
-    } else {
-        for (int i = 0; i < height_; i++) {
-            memcpy(yuv_ptr + i * width_, frame_->data[0] + i * frame_->linesize[0], width_);
+    if (hw_accel_enabled_ && src_frame->format == AV_PIX_FMT_NV12) {
+        // VAAPI outputs NV12: Y plane + interleaved UV plane
+        // Copy to contiguous buffer for OpenCV
+        uint8_t* nv12_ptr = nv12_buffer_.data;
+        int y_size = width_ * height_;
+        int uv_size = width_ * (height_ / 2);  // Interleaved UV
+
+        // Copy Y plane
+        if (src_frame->linesize[0] == width_) {
+            memcpy(nv12_ptr, src_frame->data[0], y_size);
+        } else {
+            for (int i = 0; i < height_; i++) {
+                memcpy(nv12_ptr + i * width_, src_frame->data[0] + i * src_frame->linesize[0], width_);
+            }
         }
-    }
-    yuv_ptr += y_size;
+        nv12_ptr += y_size;
 
-    // Copy U plane
-    if (frame_->linesize[1] == uv_width) {
-        memcpy(yuv_ptr, frame_->data[1], uv_width * uv_height);
-    } else {
-        for (int i = 0; i < uv_height; i++) {
-            memcpy(yuv_ptr + i * uv_width, frame_->data[1] + i * frame_->linesize[1], uv_width);
+        // Copy UV plane (interleaved)
+        if (src_frame->linesize[1] == width_) {
+            memcpy(nv12_ptr, src_frame->data[1], uv_size);
+        } else {
+            for (int i = 0; i < height_ / 2; i++) {
+                memcpy(nv12_ptr + i * width_, src_frame->data[1] + i * src_frame->linesize[1], width_);
+            }
         }
-    }
-    yuv_ptr += uv_width * uv_height;
 
-    // Copy V plane
-    if (frame_->linesize[2] == uv_width) {
-        memcpy(yuv_ptr, frame_->data[2], uv_width * uv_height);
+        // Convert NV12 to BGR using OpenCV's SIMD-optimized cvtColor
+        cv::cvtColor(nv12_buffer_, bgr_buffer, cv::COLOR_YUV2BGR_NV12);
     } else {
-        for (int i = 0; i < uv_height; i++) {
-            memcpy(yuv_ptr + i * uv_width, frame_->data[2] + i * frame_->linesize[2], uv_width);
+        // CPU decode: I420 format (Y + U + V separate planes)
+        uint8_t* yuv_ptr = yuv_buffer_.data;
+        int y_size = width_ * height_;
+        int uv_width = width_ / 2;
+        int uv_height = height_ / 2;
+
+        // Copy Y plane (handle stride if different from width)
+        if (src_frame->linesize[0] == width_) {
+            memcpy(yuv_ptr, src_frame->data[0], y_size);
+        } else {
+            for (int i = 0; i < height_; i++) {
+                memcpy(yuv_ptr + i * width_, src_frame->data[0] + i * src_frame->linesize[0], width_);
+            }
         }
+        yuv_ptr += y_size;
+
+        // Copy U plane
+        if (src_frame->linesize[1] == uv_width) {
+            memcpy(yuv_ptr, src_frame->data[1], uv_width * uv_height);
+        } else {
+            for (int i = 0; i < uv_height; i++) {
+                memcpy(yuv_ptr + i * uv_width, src_frame->data[1] + i * src_frame->linesize[1], uv_width);
+            }
+        }
+        yuv_ptr += uv_width * uv_height;
+
+        // Copy V plane
+        if (src_frame->linesize[2] == uv_width) {
+            memcpy(yuv_ptr, src_frame->data[2], uv_width * uv_height);
+        } else {
+            for (int i = 0; i < uv_height; i++) {
+                memcpy(yuv_ptr + i * uv_width, src_frame->data[2] + i * src_frame->linesize[2], uv_width);
+            }
+        }
+
+        // Convert YUV I420 to BGR using OpenCV's SIMD-optimized cvtColor
+        cv::cvtColor(yuv_buffer_, bgr_buffer, cv::COLOR_YUV2BGR_I420);
     }
 
-    // Convert YUV I420 to BGR using OpenCV's SIMD-optimized cvtColor
-    cv::cvtColor(yuv_buffer_, bgr_buffer_mat_, cv::COLOR_YUV2BGR_I420);
+    // Release FFmpeg frame data to prevent memory leak
+    av_frame_unref(frame_);
+    if (hw_accel_enabled_) {
+        av_frame_unref(sw_frame_);
+    }
 
-    // Clone output (caller may hold reference across decode calls)
-    output = bgr_buffer_mat_.clone();
+    // Return current buffer to caller (zero-copy, caller gets direct reference)
+    // Swap to other buffer for next frame
+    output = bgr_buffer;
+    current_buffer_ = 1 - current_buffer_;
 
     return true;
 }

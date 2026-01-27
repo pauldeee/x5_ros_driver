@@ -135,6 +135,13 @@ public:
                                                 &X5DriverNode::cameraTriggerCallback, this);
             ROS_INFO("Subscribing to camera trigger: %s", camera_trigger_topic_.c_str());
             ROS_INFO("Images will only be published when synchronized with triggers (~10 Hz)");
+
+            // Set frame filter to skip decoding frames that won't match any trigger
+            // This saves significant CPU by not decoding ~20fps of unneeded frames
+            g_camera->setFrameFilter([this](int64_t camera_time_ms) -> bool {
+                return shouldDecodeFrame(camera_time_ms);
+            });
+            ROS_INFO("Frame filter enabled - only decoding frames matching triggers");
         }
 
         // Get battery
@@ -601,6 +608,51 @@ private:
             waiting_for_first_trigger_ = false;
             ROS_INFO("First camera trigger received - starting synchronized publishing");
         }
+    }
+
+    /**
+     * @brief Check if a frame should be decoded based on trigger matching
+     * Called by X5Camera before decoding to skip frames that won't be published.
+     * This is a "peek" that doesn't consume triggers - actual consumption happens in publishVideo.
+     */
+    bool shouldDecodeFrame(int64_t camera_time_ms) {
+        std::lock_guard<std::mutex> lock(trigger_mutex_);
+
+        // Before first trigger: don't decode anything
+        if (waiting_for_first_trigger_) {
+            return false;
+        }
+
+        // Convert camera time to GPS time for comparison
+        int64_t output_time_ms = g_camera->cameraTimeToGpsTime(camera_time_ms);
+        ros::Time frame_ros_time;
+        frame_ros_time.sec = output_time_ms / 1000;
+        frame_ros_time.nsec = (output_time_ms % 1000) * 1000000;
+
+        // Check if there's any unconsumed trigger that could match this frame
+        for (const auto& trigger : trigger_buffer_) {
+            if (trigger.consumed) {
+                continue;
+            }
+
+            double time_since_trigger = (frame_ros_time - trigger.gps_stamp).toSec();
+
+            // Frame is before this trigger - could match a future trigger
+            if (time_since_trigger < 0) {
+                continue;
+            }
+
+            // Frame is within valid window of this trigger - decode it!
+            if (time_since_trigger <= trigger_max_age_sec_) {
+                return true;
+            }
+
+            // Frame is too late for this trigger, but might match a later one
+            // (triggers are not strictly ordered, so keep checking)
+        }
+
+        // No matching trigger found - skip decoding
+        return false;
     }
 
     // ROS

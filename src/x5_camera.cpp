@@ -386,6 +386,11 @@ void X5Camera::setExposureCallback(ExposureCallback callback) {
     exposure_callback_ = callback;
 }
 
+void X5Camera::setFrameFilter(FrameFilterCallback filter) {
+    std::lock_guard<std::mutex> lock(frame_filter_mutex_);
+    frame_filter_ = filter;
+}
+
 void X5Camera::onImuData(const std::vector<ins_camera::GyroData>& data) {
     // Get callback pointer with minimal locking (don't block video processing)
     ImuCallback callback;
@@ -426,10 +431,10 @@ void X5Camera::onVideoData(const uint8_t* data, size_t size, int64_t timestamp,
 
     // Queue the encoded packet for async processing (minimal work in callback)
     {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
+        std::lock_guard<std::mutex> lock(packet_queue_mutex_);
 
         // Drop oldest packet if queue is full (prevents memory buildup)
-        if (packet_queue_.size() >= MAX_QUEUE_SIZE) {
+        if (packet_queue_.size() >= MAX_PACKET_QUEUE_SIZE) {
             packet_queue_.pop();
         }
 
@@ -443,7 +448,7 @@ void X5Camera::onVideoData(const uint8_t* data, size_t size, int64_t timestamp,
     }
 
     // Wake up worker thread
-    queue_cv_.notify_one();
+    packet_queue_cv_.notify_one();
 }
 
 void X5Camera::startDecodeThread() {
@@ -460,26 +465,42 @@ void X5Camera::startDecodeThread() {
 
     decode_thread_running_ = true;
     decode_thread_ = std::thread(&X5Camera::decodeThreadLoop, this);
-    std::cout << "[X5Camera] Async decode thread started" << std::endl;
+    std::cout << "[X5Camera] Decode thread started" << std::endl;
+
+    // Also start publish thread (separate from decode for parallelism)
+    startPublishThread();
 }
 
 void X5Camera::stopDecodeThread() {
+    // Stop publish thread first (it consumes from frame queue)
+    stopPublishThread();
+
     if (!decode_thread_running_) {
         return;
     }
 
     decode_thread_running_ = false;
-    queue_cv_.notify_all();  // Wake up thread to exit
+    packet_queue_cv_.notify_all();  // Wake up thread to exit
 
     if (decode_thread_.joinable()) {
         decode_thread_.join();
     }
-    std::cout << "[X5Camera] Async decode thread stopped" << std::endl;
+    std::cout << "[X5Camera] Decode thread stopped" << std::endl;
 
     // Clear any remaining packets
-    std::lock_guard<std::mutex> lock(queue_mutex_);
-    while (!packet_queue_.empty()) {
-        packet_queue_.pop();
+    {
+        std::lock_guard<std::mutex> lock(packet_queue_mutex_);
+        while (!packet_queue_.empty()) {
+            packet_queue_.pop();
+        }
+    }
+
+    // Clear any remaining decoded frames
+    {
+        std::lock_guard<std::mutex> lock(frame_queue_mutex_);
+        while (!frame_queue_.empty()) {
+            frame_queue_.pop();
+        }
     }
 }
 
@@ -491,8 +512,8 @@ void X5Camera::decodeThreadLoop() {
 
         // Wait for packet
         {
-            std::unique_lock<std::mutex> lock(queue_mutex_);
-            queue_cv_.wait(lock, [this] {
+            std::unique_lock<std::mutex> lock(packet_queue_mutex_);
+            packet_queue_cv_.wait(lock, [this] {
                 return !packet_queue_.empty() || !decode_thread_running_;
             });
 
@@ -508,15 +529,115 @@ void X5Camera::decodeThreadLoop() {
             packet_queue_.pop();
         }
 
-        // Process packet (decode + callback) outside the lock
-        processEncodedPacket(packet);
+        // Decode packet and queue result (no callback here - that's publish thread's job)
+        decodePacket(packet);
     }
 
     std::cout << "[X5Camera] Decode thread exiting" << std::endl;
 }
 
-void X5Camera::processEncodedPacket(const EncodedPacket& packet) {
-    // Get callback pointer with minimal locking (don't block IMU)
+void X5Camera::decodePacket(const EncodedPacket& packet) {
+    // Check frame filter BEFORE decoding (saves CPU when using trigger sync)
+    {
+        std::lock_guard<std::mutex> lock(frame_filter_mutex_);
+        if (frame_filter_) {
+            if (!frame_filter_(packet.timestamp)) {
+                // Frame filtered out - skip decoding entirely
+                return;
+            }
+        }
+    }
+
+    // Decode the frame
+    VideoDecoder* decoder = decoder_lens0_.get();
+
+    cv::Mat frame;
+    if (decoder->decode(packet.data.data(), packet.data.size(), frame)) {
+        // Queue decoded frame for publish thread
+        // Must clone because decoder's buffer will be reused
+        DecodedFrame df;
+        df.image = frame.clone();
+        df.timestamp = packet.timestamp;
+        df.stream_index = packet.stream_index;
+
+        {
+            std::lock_guard<std::mutex> lock(frame_queue_mutex_);
+            // Drop oldest if queue full (prevent memory buildup)
+            if (frame_queue_.size() >= MAX_FRAME_QUEUE_SIZE) {
+                frame_queue_.pop();
+            }
+            frame_queue_.push(std::move(df));
+        }
+        frame_queue_cv_.notify_one();
+    }
+}
+
+// ========== Publish Thread ==========
+
+void X5Camera::startPublishThread() {
+    if (publish_thread_running_) {
+        return;
+    }
+
+    publish_thread_running_ = true;
+    publish_thread_ = std::thread(&X5Camera::publishThreadLoop, this);
+    std::cout << "[X5Camera] Publish thread started" << std::endl;
+}
+
+void X5Camera::stopPublishThread() {
+    if (!publish_thread_running_) {
+        return;
+    }
+
+    publish_thread_running_ = false;
+    frame_queue_cv_.notify_all();
+
+    if (publish_thread_.joinable()) {
+        publish_thread_.join();
+    }
+    std::cout << "[X5Camera] Publish thread stopped" << std::endl;
+
+    // Clear any remaining frames
+    std::lock_guard<std::mutex> lock(frame_queue_mutex_);
+    while (!frame_queue_.empty()) {
+        frame_queue_.pop();
+    }
+}
+
+void X5Camera::publishThreadLoop() {
+    std::cout << "[X5Camera] Publish thread running" << std::endl;
+
+    while (publish_thread_running_) {
+        DecodedFrame frame;
+
+        // Wait for decoded frame
+        {
+            std::unique_lock<std::mutex> lock(frame_queue_mutex_);
+            frame_queue_cv_.wait(lock, [this] {
+                return !frame_queue_.empty() || !publish_thread_running_;
+            });
+
+            if (!publish_thread_running_) {
+                break;
+            }
+
+            if (frame_queue_.empty()) {
+                continue;
+            }
+
+            frame = std::move(frame_queue_.front());
+            frame_queue_.pop();
+        }
+
+        // Process and publish frame (callback happens here)
+        publishFrame(frame);
+    }
+
+    std::cout << "[X5Camera] Publish thread exiting" << std::endl;
+}
+
+void X5Camera::publishFrame(const DecodedFrame& frame) {
+    // Get callback pointer
     VideoCallback callback;
     {
         std::lock_guard<std::mutex> lock(video_callback_mutex_);
@@ -527,60 +648,56 @@ void X5Camera::processEncodedPacket(const EncodedPacket& packet) {
         return;
     }
 
-    // All heavy processing happens WITHOUT holding any locks
-    VideoDecoder* decoder = decoder_lens0_.get();
+    const cv::Mat& img = frame.image;
 
-    cv::Mat frame;
-    if (decoder->decode(packet.data.data(), packet.data.size(), frame)) {
-        // Check if this is a dual fisheye frame (width ~= 2x height)
-        bool is_dual_fisheye = (frame.cols > frame.rows * 1.5);
+    // Check if this is a dual fisheye frame (width ~= 2x height)
+    bool is_dual_fisheye = (img.cols > img.rows * 1.5);
 
-        if (is_dual_fisheye) {
-            // Split into left and right halves
-            int half_width = frame.cols / 2;
-            int height = frame.rows;
+    if (is_dual_fisheye) {
+        // Split into left and right halves
+        int half_width = img.cols / 2;
+        int height = img.rows;
 
-            // Crop H.264 padding (height is often padded to multiple of 16)
-            int target_height = height;
-            if (height == 968) target_height = 960;
-            else if (height == 1088) target_height = 1080;
-            else if (height == 1296) target_height = 1280;
-            else if (height == 1936) target_height = 1920;
+        // Crop H.264 padding (height is often padded to multiple of 16)
+        int target_height = height;
+        if (height == 968) target_height = 960;
+        else if (height == 1088) target_height = 1080;
+        else if (height == 1296) target_height = 1280;
+        else if (height == 1936) target_height = 1920;
 
-            // Extract left fisheye (lens0)
-            cv::Mat left_roi = frame(cv::Rect(0, 0, half_width, target_height));
-            VideoFrame vf0;
-            vf0.timestamp_ms = static_cast<double>(packet.timestamp);
-            vf0.stream_index = 0;
-            vf0.image = left_roi;  // Zero-copy: ROI view of decoded frame
-            callback(vf0);
+        // Extract left fisheye (lens0)
+        cv::Mat left_roi = img(cv::Rect(0, 0, half_width, target_height));
+        VideoFrame vf0;
+        vf0.timestamp_ms = static_cast<double>(frame.timestamp);
+        vf0.stream_index = 0;
+        vf0.image = left_roi;
+        callback(vf0);
 
-            // Extract right fisheye (lens1)
-            cv::Mat right_roi = frame(cv::Rect(half_width, 0, half_width, target_height));
-            VideoFrame vf1;
-            vf1.timestamp_ms = static_cast<double>(packet.timestamp);
-            vf1.stream_index = 1;
-            vf1.image = right_roi;  // Zero-copy: ROI view of decoded frame
-            callback(vf1);
-        } else {
-            // Single image (shouldn't happen in normal preview mode)
-            int target_height = frame.rows;
-            if (frame.rows == 968) target_height = 960;
-            else if (frame.rows == 1088) target_height = 1080;
-            else if (frame.rows == 1296) target_height = 1280;
-            else if (frame.rows == 1936) target_height = 1920;
+        // Extract right fisheye (lens1)
+        cv::Mat right_roi = img(cv::Rect(half_width, 0, half_width, target_height));
+        VideoFrame vf1;
+        vf1.timestamp_ms = static_cast<double>(frame.timestamp);
+        vf1.stream_index = 1;
+        vf1.image = right_roi;
+        callback(vf1);
+    } else {
+        // Single image
+        int target_height = img.rows;
+        if (img.rows == 968) target_height = 960;
+        else if (img.rows == 1088) target_height = 1080;
+        else if (img.rows == 1296) target_height = 1280;
+        else if (img.rows == 1936) target_height = 1920;
 
-            cv::Mat cropped = frame;
-            if (target_height != frame.rows) {
-                cropped = frame(cv::Rect(0, 0, frame.cols, target_height));
-            }
-
-            VideoFrame vf;
-            vf.timestamp_ms = static_cast<double>(packet.timestamp);
-            vf.stream_index = packet.stream_index;
-            vf.image = cropped;
-            callback(vf);
+        cv::Mat cropped = img;
+        if (target_height != img.rows) {
+            cropped = img(cv::Rect(0, 0, img.cols, target_height));
         }
+
+        VideoFrame vf;
+        vf.timestamp_ms = static_cast<double>(frame.timestamp);
+        vf.stream_index = frame.stream_index;
+        vf.image = cropped;
+        callback(vf);
     }
 }
 

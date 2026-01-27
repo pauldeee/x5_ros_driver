@@ -9,6 +9,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/hwcontext.h>
 }
 
 namespace x5_ros_driver {
@@ -69,18 +70,30 @@ private:
     AVFrame* frame_ = nullptr;
     AVPacket* packet_ = nullptr;
 
+    // Hardware acceleration (VAAPI)
+    AVBufferRef* hw_device_ctx_ = nullptr;
+    AVFrame* sw_frame_ = nullptr;  // For HW→SW transfer
+    bool hw_accel_enabled_ = false;
+    enum AVPixelFormat hw_pix_fmt_ = AV_PIX_FMT_NONE;
+
     // Frame dimensions (set after first decode)
     int width_ = 0;
     int height_ = 0;
 
     // OpenCV buffers for fast SIMD color conversion
-    cv::Mat yuv_buffer_;       // Contiguous I420 buffer for cvtColor input
-    cv::Mat bgr_buffer_mat_;   // Pre-allocated BGR output
+    cv::Mat yuv_buffer_;       // Contiguous I420 buffer for cvtColor input (SW decode)
+    cv::Mat nv12_buffer_;      // Contiguous NV12 buffer for cvtColor input (HW decode)
+
+    // Double-buffered BGR output (eliminates clone)
+    cv::Mat bgr_buffers_[2];
+    int current_buffer_ = 0;
 
     std::mutex mutex_;
 
     void cleanup();
     bool initSwsContext(int width, int height);
+    bool initHwAccel();
+    static enum AVPixelFormat getHwFormat(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts);
 };
 
 } // namespace x5_ros_driver
