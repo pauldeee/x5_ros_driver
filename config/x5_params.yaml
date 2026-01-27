@@ -3,7 +3,7 @@
 # Preview stream resolution for live topics
 # Options: "4k", "2k", "1080", "960"
 # Lower resolution = less CPU usage
-preview_resolution: "1080"
+preview_resolution: "4k"
 
 # SD card recording resolution  
 # Options: "8k", "5.7k"
@@ -35,6 +35,7 @@ gps_time_topic: "/ext/time"   # Topic providing GPS time reference
 # Trigger synchronization
 # When enabled, only publish images synchronized with external trigger
 # Images are stamped with trigger's GPS time for lidar correlation
-use_trigger_sync: false
+use_trigger_sync: true
 camera_trigger_topic: "/camera_trigger_time"
-trigger_max_age_sec: 0.15     # Discard triggers older than this (seconds)
+trigger_max_age_sec: 0.20               # System-time fallback match window (seconds)
+trigger_gps_match_threshold_ms: 70      # GPS-domain match threshold (ms); >= decode spacing (~66ms at 30fps/2)

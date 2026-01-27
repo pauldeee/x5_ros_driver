@@ -436,6 +436,7 @@ void X5Camera::onVideoData(const uint8_t* data, size_t size, int64_t timestamp,
         // Drop oldest packet if queue is full (prevents memory buildup)
         if (packet_queue_.size() >= MAX_PACKET_QUEUE_SIZE) {
             packet_queue_.pop();
+            packets_dropped_++;
         }
 
         // Queue the packet (copy data to owned buffer)
@@ -537,39 +538,45 @@ void X5Camera::decodeThreadLoop() {
 }
 
 void X5Camera::decodePacket(const EncodedPacket& packet) {
-    // Check frame filter BEFORE decoding (saves CPU when using trigger sync)
+    // Always decode to maintain H.264 reference frame state.
+    // Skipping packets breaks the P-frame decode chain, causing most frames
+    // to fail decoding (only I-frames would succeed = ~1-2fps).
+    VideoDecoder* decoder = decoder_lens0_.get();
+
+    cv::Mat frame;
+    if (!decoder->decode(packet.data.data(), packet.data.size(), frame)) {
+        return;  // Decode failed (or no output for this NAL unit)
+    }
+
+    // Check frame filter AFTER decoding to decide whether to clone and queue.
+    // This saves the expensive clone (~22MB per 4K frame) while keeping
+    // VAAPI decode cost on the GPU.
     {
         std::lock_guard<std::mutex> lock(frame_filter_mutex_);
         if (frame_filter_) {
             if (!frame_filter_(packet.timestamp)) {
-                // Frame filtered out - skip decoding entirely
-                return;
+                return;  // Frame filtered out - skip clone and queue
             }
         }
     }
 
-    // Decode the frame
-    VideoDecoder* decoder = decoder_lens0_.get();
+    // Queue decoded frame for publish thread
+    // Must clone because decoder's buffer will be reused
+    DecodedFrame df;
+    df.image = frame.clone();
+    df.timestamp = packet.timestamp;
+    df.stream_index = packet.stream_index;
 
-    cv::Mat frame;
-    if (decoder->decode(packet.data.data(), packet.data.size(), frame)) {
-        // Queue decoded frame for publish thread
-        // Must clone because decoder's buffer will be reused
-        DecodedFrame df;
-        df.image = frame.clone();
-        df.timestamp = packet.timestamp;
-        df.stream_index = packet.stream_index;
-
-        {
-            std::lock_guard<std::mutex> lock(frame_queue_mutex_);
-            // Drop oldest if queue full (prevent memory buildup)
-            if (frame_queue_.size() >= MAX_FRAME_QUEUE_SIZE) {
-                frame_queue_.pop();
-            }
-            frame_queue_.push(std::move(df));
+    {
+        std::lock_guard<std::mutex> lock(frame_queue_mutex_);
+        // Drop oldest if queue full (prevent memory buildup)
+        if (frame_queue_.size() >= MAX_FRAME_QUEUE_SIZE) {
+            frame_queue_.pop();
+            frames_dropped_++;
         }
-        frame_queue_cv_.notify_one();
+        frame_queue_.push(std::move(df));
     }
+    frame_queue_cv_.notify_one();
 }
 
 // ========== Publish Thread ==========
@@ -838,12 +845,39 @@ bool X5Camera::syncTimeToSystem(int64_t max_offset_ms) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
-    time_offset_ms_ = offset_sum / num_samples;
+    time_offset_ms_.store(offset_sum / num_samples);
     time_offset_valid_ = true;
 
-    std::cout << "[X5Camera] Camera→System offset: " << time_offset_ms_ << " ms" << std::endl;
+    std::cout << "[X5Camera] Camera→System offset: " << time_offset_ms_.load() << " ms" << std::endl;
 
     return true;
+}
+
+void X5Camera::refreshTimeOffset() {
+    if (!connected_ || !camera_) {
+        return;
+    }
+
+    auto t1 = std::chrono::system_clock::now();
+    int64_t camera_time = camera_->GetCameraMediaTime();
+    auto t2 = std::chrono::system_clock::now();
+
+    auto t_mid = t1 + (t2 - t1) / 2;
+    int64_t system_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        t_mid.time_since_epoch()).count();
+
+    int64_t new_offset = system_time_ms - camera_time;
+
+    // Use exponential moving average to smooth jitter while tracking drift
+    int64_t old_offset = time_offset_ms_.load();
+    if (time_offset_valid_) {
+        const double alpha = 0.2;  // Faster than GPS filter to track drift promptly
+        double filtered = alpha * new_offset + (1.0 - alpha) * static_cast<double>(old_offset);
+        time_offset_ms_.store(static_cast<int64_t>(filtered));
+    } else {
+        time_offset_ms_.store(new_offset);
+        time_offset_valid_ = true;
+    }
 }
 
 void X5Camera::setGpsTimeOffset(int64_t system_time_ms, int64_t gps_time_ms) {
@@ -866,9 +900,13 @@ void X5Camera::setGpsTimeOffset(int64_t system_time_ms, int64_t gps_time_ms) {
     gps_time_offset_valid_ = true;
 }
 
+int64_t X5Camera::cameraTimeToSystemTime(int64_t camera_time_ms) {
+    return camera_time_ms + time_offset_ms_.load();
+}
+
 int64_t X5Camera::cameraTimeToGpsTime(int64_t camera_time_ms) {
     // Step 1: camera → system
-    int64_t system_time_ms = camera_time_ms + time_offset_ms_;
+    int64_t system_time_ms = camera_time_ms + time_offset_ms_.load();
 
     // Step 2: system → GPS (if available)
     std::lock_guard<std::mutex> lock(gps_time_mutex_);

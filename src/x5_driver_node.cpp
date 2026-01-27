@@ -261,7 +261,8 @@ private:
         pnh_.param<std::string>("gps_time_topic", gps_time_topic_, "/ext/time");
         pnh_.param<bool>("use_trigger_sync", use_trigger_sync_, false);
         pnh_.param<std::string>("camera_trigger_topic", camera_trigger_topic_, "/camera_trigger_time");
-        pnh_.param<double>("trigger_max_age_sec", trigger_max_age_sec_, 0.15);
+        pnh_.param<double>("trigger_max_age_sec", trigger_max_age_sec_, 0.20);
+        pnh_.param<int>("trigger_gps_match_threshold_ms", trigger_gps_match_threshold_ms_, 70);
 
         ROS_INFO("Parameters:");
         ROS_INFO("  preview_resolution: %s", preview_resolution_.c_str());
@@ -278,6 +279,7 @@ private:
         if (use_trigger_sync_) {
             ROS_INFO("  camera_trigger_topic: %s", camera_trigger_topic_.c_str());
             ROS_INFO("  trigger_max_age_sec: %.3f", trigger_max_age_sec_);
+            ROS_INFO("  trigger_gps_match_threshold_ms: %d", trigger_gps_match_threshold_ms_);
         }
     }
 
@@ -314,13 +316,15 @@ private:
             return;
         }
 
-        // Convert camera time to ROS time (used for trigger matching)
-        int64_t output_time_ms = g_camera->cameraTimeToGpsTime(static_cast<int64_t>(frame.timestamp_ms));
-        ros::Time frame_ros_time;
-        frame_ros_time.sec = output_time_ms / 1000;
-        frame_ros_time.nsec = (output_time_ms % 1000) * 1000000;
+        // Convert camera time to system/ROS time for trigger matching.
+        // This uses only the camera→system offset (single, stable offset)
+        // rather than camera→system→GPS (two offsets, prone to drift).
+        int64_t system_time_ms = g_camera->cameraTimeToSystemTime(static_cast<int64_t>(frame.timestamp_ms));
+        ros::Time frame_sys_time;
+        frame_sys_time.sec = system_time_ms / 1000;
+        frame_sys_time.nsec = (system_time_ms % 1000) * 1000000;
 
-        ros::Time stamp = frame_ros_time;  // Default: use converted time
+        ros::Time stamp = frame_sys_time;  // Default: use system time
         bool should_publish = true;
 
         // Trigger synchronization logic
@@ -333,43 +337,93 @@ private:
                 return;
             }
 
-            // Find oldest unconsumed trigger where frame_ros_time >= trigger.ros_stamp
+            // Dual-mode trigger matching (one-sided: first frame at-or-after trigger).
+            // GPS mode: match frame GPS time against trigger GPS time
+            // SYS mode (fallback): match frame system time against trigger ROS time
+            //
+            // One-sided prevents earlier frames from "stealing" later triggers.
+            // At 30fps the first frame after each 10Hz trigger is within 0-33ms.
+            bool use_gps_matching = g_camera && g_camera->isGpsTimeOffsetValid();
+
             TriggerInfo *matched_trigger = nullptr;
-            size_t matched_idx = 0;
+            int64_t match_distance_ms = 0;
+            std::string match_mode;
 
-            for (size_t i = 0; i < trigger_buffer_.size(); i++) {
-                TriggerInfo &trigger = trigger_buffer_[i];
+            if (use_gps_matching) {
+                // GPS-domain: first unconsumed trigger where frame is at-or-after trigger
+                int64_t frame_gps_ms = g_camera->cameraTimeToGpsTime(static_cast<int64_t>(frame.timestamp_ms));
 
-                // Skip consumed triggers
-                if (trigger.consumed) {
-                    continue;
-                }
+                for (size_t i = 0; i < trigger_buffer_.size(); i++) {
+                    TriggerInfo &trigger = trigger_buffer_[i];
+                    if (trigger.consumed) continue;
 
-                // Check time between frame and trigger (both in GPS time domain)
-                double time_since_trigger = (frame_ros_time - trigger.gps_stamp).toSec();
+                    int64_t diff_ms = frame_gps_ms - trigger.gps_stamp_ms;
 
-                // Frame arrived BEFORE this trigger - not a match, try next
-                if (time_since_trigger < 0) {
-                    continue;
-                }
+                    // Frame is before this trigger — not yet, stop searching
+                    // (triggers are chronological, so all later triggers are even further ahead)
+                    if (diff_ms < 0) break;
 
-                // Frame arrived too long after trigger - mark trigger as stale
-                if (time_since_trigger > trigger_max_age_sec_) {
-                    ROS_WARN_THROTTLE(5, "Discarding stale trigger (frame %.3fs after trigger > %.3fs)",
-                                      time_since_trigger, trigger_max_age_sec_);
+                    // Frame is after trigger — check if within threshold
+                    if (diff_ms <= trigger_gps_match_threshold_ms_) {
+                        matched_trigger = &trigger;
+                        match_distance_ms = diff_ms;
+                        break;
+                    }
+
+                    // Frame is too far past this trigger — mark stale and continue
                     trigger.consumed = true;
-                    continue;
                 }
 
-                // Valid match: frame arrived 0 to trigger_max_age_sec_ after trigger
-                matched_trigger = &trigger;
-                matched_idx = i;
-                break;  // Use oldest matching trigger
+                match_mode = "[GPS]";
+
+                // Stamp with frame's own GPS time (camera capture time in GPS domain)
+                if (matched_trigger) {
+                    stamp.sec = frame_gps_ms / 1000;
+                    stamp.nsec = (frame_gps_ms % 1000) * 1000000;
+                }
+            } else {
+                // System-time fallback: first unconsumed trigger where frame is at-or-after
+                for (size_t i = 0; i < trigger_buffer_.size(); i++) {
+                    TriggerInfo &trigger = trigger_buffer_[i];
+                    if (trigger.consumed) continue;
+
+                    double diff_sec = (frame_sys_time - trigger.ros_stamp).toSec();
+
+                    // Frame is before this trigger — stop
+                    if (diff_sec < 0) break;
+
+                    // Frame is after trigger — check if within threshold
+                    if (diff_sec <= trigger_max_age_sec_) {
+                        matched_trigger = &trigger;
+                        match_distance_ms = static_cast<int64_t>(diff_sec * 1000.0);
+                        break;
+                    }
+
+                    // Frame is too far past this trigger — mark stale
+                    trigger.consumed = true;
+                }
+
+                match_mode = "[SYS]";
+
+                // Stamp with trigger GPS time + capture offset
+                if (matched_trigger) {
+                    ros::Duration capture_offset = frame_sys_time - matched_trigger->ros_stamp;
+                    stamp = matched_trigger->gps_stamp + capture_offset;
+                }
             }
 
             if (matched_trigger) {
-                // Keep frame_ros_time as stamp (same time domain as /x5/imu)
-                // This preserves camera time correlation for rolling shutter deskewing
+                if (frames_matched_ == 0) {
+                    ROS_INFO("FIRST trigger match %s: distance=%ldms | "
+                             "frame_sys=%.3f trigger_ros=%.3f trigger_gps=%.3f | "
+                             "cam_offset=%ld gps_offset=%s",
+                             match_mode.c_str(), match_distance_ms,
+                             frame_sys_time.toSec(), matched_trigger->ros_stamp.toSec(),
+                             matched_trigger->gps_stamp.toSec(),
+                             g_camera ? g_camera->getTimeOffset() : 0,
+                             (g_camera && g_camera->isGpsTimeOffsetValid()) ?
+                                 std::to_string(g_camera->getGpsTimeOffset()).c_str() : "N/A");
+                }
 
                 // Mark trigger consumed only after lens1 (stream_index == 1)
                 // Both lenses arrive with same timestamp, so lens0 comes first
@@ -377,7 +431,7 @@ private:
                     matched_trigger->consumed = true;
                     frames_matched_++;
 
-                    // Clean up old consumed triggers
+                    // Clean up consumed triggers from front of buffer
                     while (!trigger_buffer_.empty() && trigger_buffer_.front().consumed) {
                         trigger_buffer_.pop_front();
                     }
@@ -446,9 +500,16 @@ private:
         if (++log_counter >= 300) {
             log_counter = 0;
             if (use_trigger_sync_) {
-                ROS_INFO("Sync stats - triggers: %lu, matched: %lu, discarded: %lu | lens0: %lu, lens1: %lu, imu: %lu",
+                const char* mode = (g_camera && g_camera->isGpsTimeOffsetValid()) ? "[GPS]" : "[SYS]";
+                ROS_INFO("Sync stats %s - triggers: %lu, matched: %lu, discarded: %lu | "
+                         "lens0: %lu, lens1: %lu, imu: %lu | cam_offset: %ld ms | "
+                         "gps_offset: %s",
+                         mode,
                          triggers_received_, frames_matched_, frames_discarded_,
-                         lens0_count_, lens1_count_, imu_count_);
+                         lens0_count_, lens1_count_, imu_count_,
+                         g_camera ? g_camera->getTimeOffset() : 0,
+                         (g_camera && g_camera->isGpsTimeOffsetValid()) ?
+                             std::to_string(g_camera->getGpsTimeOffset()).c_str() : "N/A");
             } else {
                 ROS_INFO("Published - lens0: %lu, lens1: %lu, imu: %lu",
                          lens0_count_, lens1_count_, imu_count_);
@@ -586,6 +647,11 @@ private:
                               + msg->time_ref.nsec / 1000000;
 
         g_camera->setGpsTimeOffset(system_time_ms, gps_time_ms);
+
+        // Refresh camera→system offset to track clock drift.
+        // Without this, the static offset computed at startup goes stale
+        // and frame GPS times diverge from trigger GPS times.
+        g_camera->refreshTimeOffset();
     }
 
     void cameraTriggerCallback(const sensor_msgs::TimeReference::ConstPtr &msg) {
@@ -594,6 +660,8 @@ private:
         TriggerInfo trigger;
         trigger.ros_stamp = msg->header.stamp;
         trigger.gps_stamp = msg->time_ref;
+        trigger.gps_stamp_ms = static_cast<int64_t>(msg->time_ref.sec) * 1000
+                             + msg->time_ref.nsec / 1000000;
         trigger.consumed = false;
 
         trigger_buffer_.push_back(trigger);
@@ -611,9 +679,17 @@ private:
     }
 
     /**
-     * @brief Check if a frame should be decoded based on trigger matching
-     * Called by X5Camera before decoding to skip frames that won't be published.
-     * This is a "peek" that doesn't consume triggers - actual consumption happens in publishVideo.
+     * @brief Check if a frame should be decoded based on trigger cadence.
+     *
+     * Uses cadence-based filtering (decode every other frame, ~15fps) instead of
+     * timestamp-matching against triggers. This eliminates a race condition where
+     * the trigger ROS message arrives AFTER the matching frame has already been
+     * rejected by the decode filter (the trigger and frame travel through different
+     * paths: ROS subscriber vs SDK→packet_queue→decode_thread).
+     *
+     * At 30fps input, every-other-frame gives ~66ms spacing. With 10Hz triggers
+     * (100ms apart), every trigger period is guaranteed at least one decoded frame.
+     * The actual frame→trigger pairing happens in publishVideo() using GPS timestamps.
      */
     bool shouldDecodeFrame(int64_t camera_time_ms) {
         std::lock_guard<std::mutex> lock(trigger_mutex_);
@@ -623,35 +699,16 @@ private:
             return false;
         }
 
-        // Convert camera time to GPS time for comparison
-        int64_t output_time_ms = g_camera->cameraTimeToGpsTime(camera_time_ms);
-        ros::Time frame_ros_time;
-        frame_ros_time.sec = output_time_ms / 1000;
-        frame_ros_time.nsec = (output_time_ms % 1000) * 1000000;
-
-        // Check if there's any unconsumed trigger that could match this frame
-        for (const auto& trigger : trigger_buffer_) {
-            if (trigger.consumed) {
-                continue;
-            }
-
-            double time_since_trigger = (frame_ros_time - trigger.gps_stamp).toSec();
-
-            // Frame is before this trigger - could match a future trigger
-            if (time_since_trigger < 0) {
-                continue;
-            }
-
-            // Frame is within valid window of this trigger - decode it!
-            if (time_since_trigger <= trigger_max_age_sec_) {
-                return true;
-            }
-
-            // Frame is too late for this trigger, but might match a later one
-            // (triggers are not strictly ordered, so keep checking)
+        // Cadence-based: decode if >=60ms since last decode (camera time domain).
+        // At 30fps (33ms spacing), this decodes every other frame = ~15fps.
+        // Avoids the race condition of timestamp-based trigger matching in the
+        // decode thread, while still saving ~50% of decode work vs unfiltered.
+        int64_t elapsed = camera_time_ms - last_decoded_camera_time_ms_;
+        if (elapsed >= 60 || last_decoded_camera_time_ms_ == 0) {
+            last_decoded_camera_time_ms_ = camera_time_ms;
+            return true;
         }
 
-        // No matching trigger found - skip decoding
         return false;
     }
 
@@ -700,17 +757,20 @@ private:
     bool use_trigger_sync_;
     std::string camera_trigger_topic_;
     double trigger_max_age_sec_;
+    int trigger_gps_match_threshold_ms_ = 70;
     ros::Subscriber sub_camera_trigger_;
 
     // Trigger state (protected by trigger_mutex_)
     struct TriggerInfo {
         ros::Time ros_stamp;   // header.stamp - ROS time when trigger arrived
         ros::Time gps_stamp;   // time_ref - GPS time to stamp the image
+        int64_t gps_stamp_ms;  // time_ref in milliseconds for fast arithmetic
         bool consumed;         // Whether this trigger has been used
     };
     std::deque <TriggerInfo> trigger_buffer_;
     std::mutex trigger_mutex_;
     bool waiting_for_first_trigger_ = true;
+    int64_t last_decoded_camera_time_ms_ = 0;  // Cadence tracking for shouldDecodeFrame
 
     // Trigger sync stats
     uint64_t triggers_received_ = 0;

@@ -209,7 +209,7 @@ public:
     /**
      * @brief Get time offset (system_time_ms = camera_time_ms + offset)
      */
-    int64_t getTimeOffset() const { return time_offset_ms_; }
+    int64_t getTimeOffset() const { return time_offset_ms_.load(); }
 
     /**
      * @brief Check if camera time offset has been computed
@@ -224,9 +224,34 @@ public:
     void setGpsTimeOffset(int64_t system_time_ms, int64_t gps_time_ms);
 
     /**
+     * @brief Refresh camera→system time offset to track clock drift.
+     * Call periodically (e.g., from GPS time callback) to prevent
+     * the static offset from going stale as clocks drift.
+     */
+    void refreshTimeOffset();
+
+    /**
      * @brief Check if GPS time offset is valid
      */
     bool isGpsTimeOffsetValid() const { return gps_time_offset_valid_; }
+
+    /**
+     * @brief Get GPS time offset (gps_time_ms = system_time_ms + offset)
+     */
+    int64_t getGpsTimeOffset() const { return gps_time_offset_ms_; }
+
+    /**
+     * @brief Get queue drop counts for diagnostics
+     */
+    uint64_t getPacketsDropped() const { return packets_dropped_.load(); }
+    uint64_t getFramesDropped() const { return frames_dropped_.load(); }
+
+    /**
+     * @brief Convert camera timestamp to system/ROS time
+     * @param camera_time_ms Camera media time in milliseconds
+     * @return System time in milliseconds
+     */
+    int64_t cameraTimeToSystemTime(int64_t camera_time_ms);
 
     /**
      * @brief Convert camera timestamp to GPS time
@@ -241,7 +266,7 @@ private:
     friend class StreamDelegateImpl;
 
     // Time synchronization (camera to system)
-    int64_t time_offset_ms_ = 0;          // system_time_ms = camera_time_ms + offset
+    std::atomic<int64_t> time_offset_ms_{0};  // system_time_ms = camera_time_ms + offset
     bool time_offset_valid_ = false;
 
     // GPS time synchronization (system to GPS)
@@ -323,6 +348,10 @@ private:
     std::mutex frame_queue_mutex_;
     std::condition_variable frame_queue_cv_;
     static constexpr size_t MAX_FRAME_QUEUE_SIZE = 4;  // 2 frames worth (lens0+lens1 each)
+
+    // Drop counters for diagnostics
+    std::atomic<uint64_t> packets_dropped_{0};
+    std::atomic<uint64_t> frames_dropped_{0};
 
     // Worker threads
     std::thread decode_thread_;
